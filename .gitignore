@@ -1,0 +1,34 @@
+# Rust build output
+/linux/target/
+**/*.rs.bk
+
+# Gradle / Android build output
+/build/
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/protocol/build/
+/android/local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+.DS_Store
+
+# Test scratch and local state
+/tmp/
+*.log
+*.bak
+*.orig
+*.tmp
+
+# Toolchain / SDK pinned per machine
+/android/.kotlin/
+.kotlin/

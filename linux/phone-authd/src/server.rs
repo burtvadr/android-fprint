@@ -1,0 +1,277 @@
+//! Process wiring: the control socket, the transport listeners, and shutdown.
+//!
+//! The control socket is the only way an unprivileged process can reach the
+//! engine, and every request on it is attributed to a verified peer UID before
+//! it is allowed to name a Linux user (`PROTOCOL.md` §14).
+
+use std::os::fd::AsRawFd;
+use std::sync::Arc;
+
+use android_fprint_protocol::errors::{ProtocolError, Result};
+use android_fprint_protocol::types::Transport;
+use tokio::io::BufReader;
+use tokio::net::{UnixListener, UnixStream};
+
+use crate::audit::Event;
+use crate::config::{self, Config, CONTROL_GROUP};
+use crate::engine::Engine;
+use crate::ipc::{self, ControlRequest, ControlResponse};
+use crate::transport;
+
+/// Default timeout for an authentication, generous enough for a human to
+/// complete a fingerprint check plus a confirmation dialog.
+pub const DEFAULT_AUTH_TIMEOUT_MS: u64 = 90_000;
+
+/// Binds the control socket with restricted permissions.
+///
+/// Must be called from inside the Tokio runtime: converting a std listener into a
+/// reactor-aware one requires a live reactor.
+pub fn bind_control_socket(path: &std::path::Path) -> Result<UnixListener> {
+    if let Some(parent) = path.parent() {
+        config::ensure_private_dir(parent).map_err(|e| {
+            ProtocolError::Internal(format!("create socket dir {}: {e}", parent.display()))
+        })?;
+    }
+    // A stale socket from a crashed daemon must not block startup.
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+    let listener = std::os::unix::net::UnixListener::bind(path)
+        .map_err(|e| ProtocolError::Internal(format!("bind {}: {e}", path.display())))?;
+    // Set restrictive permissions before the socket is reachable, so there is no
+    // window in which an unprivileged process could connect.
+    restrict_socket(path);
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| ProtocolError::Internal(format!("set nonblocking: {e}")))?;
+    UnixListener::from_std(listener)
+        .map_err(|e| ProtocolError::Internal(format!("register listener: {e}")))
+}
+
+/// Makes the socket reachable by root and the `phone-auth` group only.
+fn restrict_socket(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
+    // Chown to the control group when we are privileged enough to do so. If the
+    // group does not exist yet the socket stays root-owned, which is still safe:
+    // only root can connect.
+    let _ = std::process::Command::new("chgrp")
+        .arg(CONTROL_GROUP)
+        .arg(path)
+        .status();
+}
+
+/// Serves the control socket until `shutdown` fires.
+pub async fn serve_control(
+    engine: Arc<Engine>,
+    config: Config,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let listener = bind_control_socket(&config.socket_path)?;
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    let _ = std::fs::remove_file(&config.socket_path);
+                    return Ok(());
+                }
+            }
+            accepted = listener.accept() => {
+                let (stream, _) = match accepted {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Transient accept errors (EMFILE, ECONNABORTED) must not
+                        // kill the daemon.
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::WouldBlock
+                        ) {
+                            continue;
+                        }
+                        return Err(ProtocolError::Internal(format!("accept: {e}")));
+                    }
+                };
+                let engine = engine.clone();
+                let cfg = config.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_control_connection(engine.clone(), stream, cfg).await {
+                        engine
+                            .audit()
+                            .write(&Event::new("ipc_error").denied("INTERNAL").detail(e.to_string()));
+                    }
+                });
+            }
+        }
+    }
+}
+
+async fn handle_control_connection(
+    engine: Arc<Engine>,
+    stream: UnixStream,
+    config: Config,
+) -> Result<()> {
+    // Peer credentials must be read from the socket itself, before any request
+    // is interpreted.
+    let peer = ipc::peer_credentials(stream.as_raw_fd())
+        .map_err(|e| ProtocolError::Internal(format!("SO_PEERCRED: {e}")))?;
+
+    let (r, w) = tokio::io::split(stream);
+    let mut reader = BufReader::new(r);
+    let mut writer = w;
+
+    let Some(request) = ipc::read_request(&mut reader)
+        .await
+        .map_err(|e| ProtocolError::BadRequest(format!("control request: {e}")))?
+    else {
+        return Ok(());
+    };
+
+    let response = dispatch(&engine, &config, peer, request).await;
+    ipc::write_response(&mut writer, &response)
+        .await
+        .map_err(|e| ProtocolError::Internal(format!("write control response: {e}")))?;
+    Ok(())
+}
+
+async fn dispatch(
+    engine: &Arc<Engine>,
+    config: &Config,
+    peer: ipc::PeerCredentials,
+    request: ControlRequest,
+) -> ControlResponse {
+    match request {
+        ControlRequest::List => ControlResponse::ok(serde_json::json!({
+            "devices": engine.list_devices(),
+        })),
+
+        ControlRequest::Status => ControlResponse::ok(engine.status()),
+
+        ControlRequest::PairingCode => match engine.pairing_code() {
+            Some((code, expires_at)) => ControlResponse::ok(serde_json::json!({
+                "active": true,
+                "code": code,
+                "expires_at": expires_at,
+                "phase": format!("{:?}", engine.pairing_phase()).to_lowercase(),
+            })),
+            None => ControlResponse::ok(serde_json::json!({ "active": false })),
+        },
+
+        ControlRequest::Pair {
+            code,
+            timeout_ms: _,
+        } => {
+            let peer_key = format!("uid:{}", peer.uid);
+            match engine.begin_pairing(code, peer_key) {
+                Ok((chosen, expires_at)) => ControlResponse::ok(serde_json::json!({
+                    "chosen_code": chosen,
+                    "expires_at": expires_at,
+                    "seconds_remaining": expires_at.saturating_sub(android_fprint_protocol::unix_now()),
+                    "phase": "awaiting_device",
+                    "instructions": "Start pairing on the phone now. The code to compare appears here once it connects.",
+                })),
+                Err(e) => ControlResponse::from_protocol_error(&e),
+            }
+        }
+
+        ControlRequest::ConfirmPairing => match engine.confirm_pairing() {
+            Ok(()) => ControlResponse::ok(serde_json::json!({ "confirmed": true })),
+            Err(e) => ControlResponse::from_protocol_error(&e),
+        },
+
+        ControlRequest::Authenticate {
+            user,
+            purpose,
+            service,
+            operation,
+            device,
+            timeout_ms,
+        } => {
+            // Bind the request to the verified peer before anything else.
+            let username = match ipc::authorize_caller(peer, &user) {
+                Ok(u) => u,
+                Err(e) => {
+                    engine.audit().write(
+                        &Event::new("auth")
+                            .denied(e.code().as_str())
+                            .username(user.clone())
+                            .local_uid(peer.uid)
+                            .detail("caller may not authenticate as that user"),
+                    );
+                    return ControlResponse::from_protocol_error(&e);
+                }
+            };
+            match engine
+                .authenticate(crate::engine::AuthContext {
+                    local_uid: peer.uid,
+                    username: &username,
+                    purpose: &purpose,
+                    service: &service,
+                    operation: &operation,
+                    device_selector: device.as_deref(),
+                    timeout_ms: timeout_ms.unwrap_or(DEFAULT_AUTH_TIMEOUT_MS),
+                    transport_pref: config.transport,
+                })
+                .await
+            {
+                Ok(outcome) => ControlResponse::ok(outcome.to_json()),
+                Err(e) => ControlResponse::from_protocol_error(&e),
+            }
+        }
+
+        ControlRequest::Revoke { device } => {
+            // Revocation changes who may authenticate, so only root may do it.
+            if peer.uid != 0 {
+                return ControlResponse::err(
+                    "PERMISSION_DENIED",
+                    "only root may revoke an authenticator",
+                );
+            }
+            match engine.revoke_device(&device) {
+                Ok(name) => ControlResponse::ok(serde_json::json!({ "revoked": name })),
+                Err(e) => ControlResponse::from_protocol_error(&e),
+            }
+        }
+    }
+}
+
+/// Starts every listener and waits for shutdown.
+pub async fn run(
+    engine: Arc<Engine>,
+    config: Config,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let mdns = if config.advertise_mdns {
+        let host_key_id = engine.host.public_key().key_id_hex();
+        match transport::wifi::advertise(&config, &engine.host_name, &host_key_id) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                // Discovery failing must not stop authentication: a device can
+                // still connect by address.
+                engine
+                    .audit()
+                    .write(&Event::new("mdns_unavailable").detail(e.to_string()));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let wifi = transport::wifi::serve(engine.clone(), config.clone(), shutdown.clone());
+    let ctl = serve_control(engine.clone(), config, shutdown);
+
+    tokio::select! {
+        r = wifi => {
+            let _ = &mdns;
+            r
+        }
+        r = ctl => r,
+    }
+}
+
+/// The transports this build supports, for `status` output.
+pub fn supported_transports() -> Vec<Transport> {
+    vec![Transport::Wifi, Transport::Ble]
+}

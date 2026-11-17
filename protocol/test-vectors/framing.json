@@ -1,0 +1,45 @@
+{
+  "description": "Frame layout: magic 'PAF1', version, type, flags, payload length, payload.",
+  "frames": [
+    {
+      "frame_hex": "50414631010014000000000000",
+      "msg_type": 20,
+      "name": "empty_payload"
+    },
+    {
+      "frame_hex": "5041463101000c0000000000f8ab67686f73745f6964502222222222222222222222222222222267707572706f7365647375646f6773657276696365647375646f68757365726e616d6565616c696365696368616c6c656e676558204444444444444444444444444444444444444444444444444444444444444444696465766963655f69645033333333333333333333333333333333696973737565645f61741a6553f100696f7065726174696f6e6c61757468656e7469636174656a657870697265735f61741a6553f13c6a726571756573745f696450111111111111111111111111111111116a73657373696f6e5f69645055555555555555555555555555555555",
+      "msg_type": 12,
+      "name": "auth_request"
+    },
+    {
+      "frame_hex": "5041463101000c00000000012cabababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+      "msg_type": 12,
+      "name": "large_payload"
+    }
+  ],
+  "header_len": 13,
+  "magic_hex": "50414631",
+  "rejected": [
+    {
+      "hex": "deadbeef010001000000000000",
+      "name": "bad_magic",
+      "reason": "magic is not PAF1"
+    },
+    {
+      "hex": "50414631020001000000000000",
+      "name": "future_version",
+      "reason": "version 2 is not implemented"
+    },
+    {
+      "hex": "50414631010001000100000000",
+      "name": "nonzero_flags",
+      "reason": "flags must be zero in v1"
+    },
+    {
+      "hex": "50414631010001000000011170",
+      "name": "oversized_length",
+      "reason": "payload length exceeds the cap"
+    }
+  ],
+  "spec": "PROTOCOL.md §4"
+}

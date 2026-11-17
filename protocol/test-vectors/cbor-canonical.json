@@ -1,0 +1,260 @@
+{
+  "canonical": [
+    {
+      "accepted": true,
+      "description": "smallest unsigned integer",
+      "name": "uint_zero",
+      "roundtrip_stable": true,
+      "value_hex": "00"
+    },
+    {
+      "accepted": true,
+      "description": "largest single-byte integer",
+      "name": "uint_23",
+      "roundtrip_stable": true,
+      "value_hex": "17"
+    },
+    {
+      "accepted": true,
+      "description": "first two-byte integer",
+      "name": "uint_24",
+      "roundtrip_stable": true,
+      "value_hex": "1818"
+    },
+    {
+      "accepted": true,
+      "description": "largest one-byte argument",
+      "name": "uint_255",
+      "roundtrip_stable": true,
+      "value_hex": "18ff"
+    },
+    {
+      "accepted": true,
+      "description": "first three-byte integer",
+      "name": "uint_256",
+      "roundtrip_stable": true,
+      "value_hex": "190100"
+    },
+    {
+      "accepted": true,
+      "description": "first four-byte integer",
+      "name": "uint_65536",
+      "roundtrip_stable": true,
+      "value_hex": "1a00010000"
+    },
+    {
+      "accepted": true,
+      "description": "largest unsigned integer",
+      "name": "uint_max",
+      "roundtrip_stable": true,
+      "value_hex": "1bffffffffffffffff"
+    },
+    {
+      "accepted": true,
+      "description": "-1 encoded as major type 1, argument 0",
+      "name": "nint_minus_one",
+      "roundtrip_stable": true,
+      "value_hex": "20"
+    },
+    {
+      "accepted": true,
+      "description": "-24 still fits in one byte",
+      "name": "nint_minus_24",
+      "roundtrip_stable": true,
+      "value_hex": "37"
+    },
+    {
+      "accepted": true,
+      "description": "-25 needs two bytes",
+      "name": "nint_minus_25",
+      "roundtrip_stable": true,
+      "value_hex": "3818"
+    },
+    {
+      "accepted": true,
+      "description": "empty text string",
+      "name": "text_empty",
+      "roundtrip_stable": true,
+      "value_hex": "60"
+    },
+    {
+      "accepted": true,
+      "description": "ascii text string",
+      "name": "text_ascii",
+      "roundtrip_stable": true,
+      "value_hex": "65616c696365"
+    },
+    {
+      "accepted": true,
+      "description": "multi-byte UTF-8 text string",
+      "name": "text_unicode",
+      "roundtrip_stable": true,
+      "value_hex": "6a42656e75747a6572c3a4"
+    },
+    {
+      "accepted": true,
+      "description": "empty byte string",
+      "name": "bytes_empty",
+      "roundtrip_stable": true,
+      "value_hex": "40"
+    },
+    {
+      "accepted": true,
+      "description": "16-byte identifier",
+      "name": "bytes_16",
+      "roundtrip_stable": true,
+      "value_hex": "5033333333333333333333333333333333"
+    },
+    {
+      "accepted": true,
+      "description": "32-byte challenge",
+      "name": "bytes_32",
+      "roundtrip_stable": true,
+      "value_hex": "58204444444444444444444444444444444444444444444444444444444444444444"
+    },
+    {
+      "accepted": true,
+      "description": "false",
+      "name": "bool_false",
+      "roundtrip_stable": true,
+      "value_hex": "f4"
+    },
+    {
+      "accepted": true,
+      "description": "true",
+      "name": "bool_true",
+      "roundtrip_stable": true,
+      "value_hex": "f5"
+    },
+    {
+      "accepted": true,
+      "description": "map keys sorted by encoded bytes: 'b' (0x6162) before 'aa' (0x626161)",
+      "name": "map_canonical_order",
+      "roundtrip_stable": true,
+      "value_hex": "a261620162616102"
+    },
+    {
+      "accepted": true,
+      "description": "map containing an array of maps",
+      "name": "nested_map",
+      "roundtrip_stable": true,
+      "value_hex": "a165696e6e657282a1617801a1617902"
+    }
+  ],
+  "description": "Canonical CBOR encoding vectors. Both implementations MUST encode accepted values identically and reject every value in non_canonical.",
+  "non_canonical": [
+    {
+      "description": "0 encoded in two bytes",
+      "name": "uint_nonminimal_8",
+      "rejected_by_rust": true,
+      "rule": "R2",
+      "value_hex": "1800"
+    },
+    {
+      "description": "24 encoded in three bytes",
+      "name": "uint_nonminimal_16",
+      "rejected_by_rust": true,
+      "rule": "R2",
+      "value_hex": "190018"
+    },
+    {
+      "description": "256 encoded in five bytes",
+      "name": "uint_nonminimal_32",
+      "rejected_by_rust": true,
+      "rule": "R2",
+      "value_hex": "1a00000100"
+    },
+    {
+      "description": "indefinite-length byte string",
+      "name": "indefinite_bytes",
+      "rejected_by_rust": true,
+      "rule": "R1",
+      "value_hex": "5f4101ff"
+    },
+    {
+      "description": "indefinite-length array",
+      "name": "indefinite_array",
+      "rejected_by_rust": true,
+      "rule": "R1",
+      "value_hex": "9f01ff"
+    },
+    {
+      "description": "indefinite-length map",
+      "name": "indefinite_map",
+      "rejected_by_rust": true,
+      "rule": "R1",
+      "value_hex": "bfff"
+    },
+    {
+      "description": "tagged item",
+      "name": "tag",
+      "rejected_by_rust": true,
+      "rule": "R6",
+      "value_hex": "c000"
+    },
+    {
+      "description": "64-bit float",
+      "name": "float64",
+      "rejected_by_rust": true,
+      "rule": "R7",
+      "value_hex": "fb0000000000000000"
+    },
+    {
+      "description": "undefined simple value",
+      "name": "undefined",
+      "rejected_by_rust": true,
+      "rule": "R7",
+      "value_hex": "f7"
+    },
+    {
+      "description": "valid value followed by a stray byte",
+      "name": "trailing_bytes",
+      "rejected_by_rust": true,
+      "rule": "R4/R5 frame integrity",
+      "value_hex": "0102"
+    },
+    {
+      "description": "byte string shorter than declared",
+      "name": "truncated_bytes",
+      "rejected_by_rust": true,
+      "rule": "R1",
+      "value_hex": "430102"
+    },
+    {
+      "description": "map keys out of canonical order",
+      "name": "map_unsorted",
+      "rejected_by_rust": true,
+      "rule": "R4",
+      "value_hex": "a2616201616102"
+    },
+    {
+      "description": "map with a repeated key",
+      "name": "map_duplicate_key",
+      "rejected_by_rust": true,
+      "rule": "R5",
+      "value_hex": "a2616101616102"
+    },
+    {
+      "description": "overlong UTF-8 encoding of '/'",
+      "name": "text_overlong",
+      "rejected_by_rust": true,
+      "rule": "R8/§8.6",
+      "value_hex": "62c0af"
+    },
+    {
+      "description": "UTF-8 encoded surrogate U+D800",
+      "name": "text_surrogate",
+      "rejected_by_rust": true,
+      "rule": "R8/§8.6",
+      "value_hex": "63eda080"
+    },
+    {
+      "description": "code point above U+10FFFF",
+      "name": "text_above_max",
+      "rejected_by_rust": true,
+      "rule": "R8/§8.6",
+      "value_hex": "64f4908080"
+    }
+  ],
+  "spec": "PROTOCOL.md §8.5"
+}

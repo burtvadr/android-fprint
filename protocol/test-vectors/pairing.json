@@ -1,0 +1,30 @@
+{
+  "code": "000207",
+  "description": "Pairing transcript. Both sides derive the same session secret from the two nonces; the MACs prove it.",
+  "device_id": "33333333333333333333333333333333",
+  "device_key": {
+    "key_id_hex": "d12fb2a6953f71ca1db2bb3853709e1afa1835b83c0dd113b64eeadeddeb4913",
+    "public_key_hex": "04f68b1de0f5ce686192f4bd0fd34163863f2e89d385f8bcfb85979533a57ac9b04f022ab6b096c8bf42804d8e67d38b3f88866980cc903f68fde9d2e143d93267"
+  },
+  "device_mac_hex": "6387bd8f0543e354966b2340453d2b726e3079214f306193778cbce4ffb4c4c2",
+  "host_id": "22222222222222222222222222222222",
+  "host_key": {
+    "key_id_hex": "16edb9b8cf52e98c431dbf8802a0f25cc000bff5315a04ac02235b423b239c08",
+    "public_key_hex": "04418b9b63bd211b39c0f97628be371fa2dc1714f9272dd6bc33e1a60f1562398372891f6a9194aa9efcb0981159bad37674592302517c59efcd84588b188129e4"
+  },
+  "host_mac_hex": "65d528b4c6f98a77a16677495f09893bcfdb1ec48baf09327e1e7a25737be7fb",
+  "must_differ": [
+    {
+      "expect_valid": false,
+      "mac_hex": "0e6d5f981aaf5820cd03169df4343d08d44aa9f26d42ed0a438e0575bdd595e6",
+      "name": "substituted_device_key",
+      "reason": "an attacker substituting its own device key cannot produce the MAC the host will accept"
+    }
+  ],
+  "session": {
+    "device_nonce": "9999999999999999999999999999999999999999999999999999999999999999",
+    "host_nonce": "8888888888888888888888888888888888888888888888888888888888888888",
+    "session_id": "99999999999999999999999999999999"
+  },
+  "spec": "PROTOCOL.md §6"
+}
