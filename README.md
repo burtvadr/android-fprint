@@ -230,3 +230,7 @@ one device and is revocable independently.
 * [`docs/architecture.md`](docs/architecture.md) — layering and component map
 * [`docs/threat-model.md`](docs/threat-model.md) — adversaries, defences, limitations
 * [`docs/pairing.md`](docs/pairing.md) — the pairing flow and its guarantees
+
+## License
+
+0BSD. Do whatever you want with it; there is no warranty.
