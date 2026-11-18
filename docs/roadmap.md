@@ -209,6 +209,32 @@ ls -l /usr/lib/polkit-1/polkit-agent-helper-1
 journalctl -b --no-pager | grep -i 'polkit\|pam_unix\|pam_phone'
 ```
 
+On the tested Arch machine:
+
+- `/usr/lib/pam.d/polkit-1` is the vendor file and includes `system-auth`.
+- `polkit-agent-helper-1` is socket-activated through
+  `polkit-agent-helper@.service`.
+- That unit has `PrivateNetwork=yes`, `RestrictAddressFamilies=AF_UNIX` and
+  `ProtectSystem=strict`. A Unix-socket connection to
+  `/run/phone-authd/control.sock` should still be possible, but the helper's UID
+  and group access must be confirmed.
+- The journal shows `polkit-agent-helper-1` running `pam_unix(polkit-1:auth)`,
+  then polkitd reporting the authorization result. It does not show which UID the
+  helper had.
+
+Use:
+
+```bash
+sudo ./packaging/arch/pam-polkit-phone.sh --dry-run
+```
+
+The installer adds the same `sufficient` phone line before
+`auth include system-auth`; it does not edit the vendor file. Rollback is:
+
+```bash
+sudo ./packaging/arch/pam-polkit-phone.sh --rollback
+```
+
 The PAM message added for GDM is best-effort and consumer-specific. It is not a
 reason to assume the polkit dialog will display it.
 
