@@ -299,6 +299,79 @@ separate phones/keys.
 Do not model this as `host_id = archlinux/alice`. That would duplicate host
 identity and TLS pins per account and make the machine look like many hosts.
 
+### Worked multi-user scenarios
+
+**One PC, two users, two phones.** This is the recommended independent-trust
+model:
+
+```text
+host: archlinux
+  phone A -> device record A, account_scope=self, accounts=[desktop]
+  phone B -> device record B, account_scope=self, accounts=[alice]
+
+desktop is in wheel; alice is not.
+```
+
+- Phone A can authenticate `desktop` for login, unlock, polkit and `sudo`.
+  Whether `sudo` actually succeeds is still decided by `sudoers`; the phone
+  proves *who* desktop is, it does not grant the privilege.
+- Phone B can authenticate `alice` for login, unlock and user-level polkit
+  prompts. It cannot make `sudo` succeed because `alice` is not in `sudoers`.
+  The host should also refuse to send `auth.sudo` requests to a device whose
+  account scope does not include an account allowed to use it.
+- A request for `desktop` from phone B must be refused by the host before the
+  phone is asked. The phone is not a second authorization system.
+- The two phones have separate device keys; compromise of one does not become
+  compromise of the other.
+
+**One phone, two users.** Supported through `selected` scope, but it is one
+compromise domain:
+
+```text
+phone A -> account_scope=selected, accounts=[desktop, alice]
+```
+
+The phone shows both accounts. The host still enforces each account's normal
+rights. A phone compromise can approve any account in its scope; use separate
+phones if that matters.
+
+**One phone, all normal accounts.** `account_scope=all`, excluding root. This is
+convenience for a shared device and a larger blast radius. It does not make every
+account an administrator.
+
+**Root.** `allow_root` is separate and defaults to false. `all+root` is a
+deliberate, strongly discouraged policy; root can already change `sudoers`,
+polkit and PAM, so treating a phone as a root factor deserves its own warning and
+audit entry.
+
+### Authentication is not authorization
+
+| Layer | Decides | Phone role |
+|---|---|---|
+| Pairing | Is this device/host key trusted? | Consent + code entry |
+| Account scope | Which Linux accounts may this device approve? | Displays and may narrow |
+| PAM authentication | Is this the claimed user? | Strong-biometric signature |
+| `sudoers` | May this user run `sudo`? | None |
+| polkit | Is this action allowed for this user? | None; the prompt may use PAM |
+| Phone consent | Does the human approve this request? | Final accept/deny |
+
+A phone for a non-admin user is therefore useful without any root access: it
+replaces password entry for login, screen unlock and user-level authentication
+prompts. It cannot turn that user into an administrator, and the host must never
+present it as if it could.
+
+### Installation and account scope
+
+Installing a PAM/polkit/GDM line is machine-wide and needs root. The account
+scope and per-user enable/disable policy are separate:
+
+- a user can enable/disable their own operations without root;
+- a phone can mask an operation without root;
+- adding an account to a phone's scope, enabling global actions, or allowing root
+  needs host administrator/root authorization;
+- uninstalling the integration needs root.
+
+
 ### Capability IDs, not generic labels
 
 A toggle for "systemctl" is too broad. Negotiate the actual action identifiers,
