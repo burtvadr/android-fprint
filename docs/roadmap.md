@@ -345,6 +345,69 @@ These are properties every implementation must keep, even in the minimal version
 The minimal set is the next transport task. The upgrade items stay on the
 roadmap; the robustness rules apply from the first implementation.
 
+## Native desktop integration via fprintd (future)
+
+GNOME and KDE show a native fingerprint UI only because they talk to `fprintd`,
+which talks to `libfprint`. A PAM module alone cannot make that UI appear: it only
+runs after the desktop has already chosen an authentication method.
+
+So the question is not “can we pretend to be a USB sensor?” It is “can we expose a
+virtual biometric device through the same documented interfaces, honestly?”
+
+### What the OS expects
+
+- `fprintd` implements the `net.reactivated.Fprint` D-Bus API: list devices,
+  claim, enroll, verify, list/delete prints.
+- `libfprint` supports `FP_DEVICE_TYPE_VIRTUAL`; its virtual drivers
+  (`FP_VIRTUAL_DEVICE`, `FP_VIRTUAL_IMAGE`) are test tools. They still perform
+  local print matching, not remote signature verification.
+- GDM, GNOME Settings, KDE lock screen and `pam_fprintd` all use that pipeline.
+
+### Options
+
+1. **PAM only (current)** — scoped `gdm-password` and `polkit-1` overrides.
+   No native fingerprint icon; the phone prompt appears after the password form
+   is submitted. Smallest, most portable, no fake device.
+2. **fprintd-compatible service** — implement the documented D-Bus API with a
+   virtual device named “Android phone (Pixel 9)”. `VerifyStart` triggers the
+   phone challenge; a successful signature is reported as a verify result.
+   No hardware is faked. Problems: it conflicts with a real `fprintd`; losing the
+   local sensor unless proxied; enrollment becomes “pair phone”, not “scan
+   finger”; the API carries the target user but not the PAM service, so the phone
+   cannot distinguish GDM from sudo from polkit.
+3. **libfprint virtual driver** — add a C driver that verifies via the phone.
+   Most native, but it is LGPL code in our 0BSD tree, requires a patched or
+   separately packaged libfprint, needs synthetic print data, and runs inside a
+   root system daemon. Heavy maintenance and a large new trust boundary.
+4. **Patch GDM/KDE** — not portable, not a clean integration.
+
+### Where the line is
+
+A virtual device is **not** a lie if it is named as a remote phone authenticator,
+uses the documented interface correctly, and does not claim a local sensor
+captured a fingerprint. It becomes a lie when the UI says “fingerprint sensor”,
+when enrollment data pretends to be a fingerprint template, or when the weaker
+remote trust model is hidden from the user.
+
+The clean framing is: **the phone is a biometric authenticator exposed through
+fprintd**, not a fake USB fingerprint reader.
+
+### Security constraints
+
+- The service must verify the D-Bus caller and target user; no user may trigger
+  another account's phone prompt.
+- `fprintd`'s API does not carry PAM service/operation context. Consent quality is
+  worse than the direct PAM path unless the protocol is extended.
+- Pairing and revocation must map to enrollment and print deletion.
+- A real local sensor must keep working; do not silently replace `fprintd`.
+- Account binding (SEC-004) must exist before a system-wide biometric adapter is
+  safe on a multi-user machine.
+
+Decision: **PAM integration first.** A fprintd-compatible adapter is a later
+experiment, after SEC-004 and only if native GNOME/KDE fingerprint UI is worth the
+packaging and trust-boundary cost. Do not fake USB hardware or a fingerprint
+template.
+
 ## What "supported" means
 
 A platform is supported only when it has:
@@ -932,6 +995,9 @@ Do these before expanding the platform surface:
       opt-in and explicitly warn about prompt fatigue.
 - [ ] Keep `/etc/pam.d` overrides in `/etc`, never edit vendor files under
       `/usr/lib/pam.d`.
+- [ ] After SEC-004, evaluate a fprintd-compatible virtual device for native
+      GNOME/KDE fingerprint UI. Do not fake USB hardware or a fingerprint
+      template; preserve a real local sensor.
 - [ ] Add a root-shell recovery procedure and a PAM rollback test to every
       documented flow.
 - [ ] Add device-user binding and per-user rate limits.
@@ -1024,3 +1090,4 @@ These are separate adapters, not assumptions that the Linux code is portable.
 | 2026-11-18 | A relay/rendezvous fallback is optional. Prefer Tailscale/WireGuard/SSH or a minimal protocol-specific relay over adopting Syncthing's relay stack. |
 | 2026-11-18 | Syncthing is reference behavior only. Work is split into minimal V2/VPN fixes, optional upgrades, and ongoing robustness; no code, BEP, global discovery or relay is imported. |
 | 2026-11-18 | Current integration priority is GDM password login, `pkexec` and `systemctl` via polkit, using scoped `/etc/pam.d` overrides. Do not edit `system-auth` or `gdm-fingerprint` first. |
+| 2026-11-18 | Native GNOME/KDE fingerprint UI is a future fprintd-compatible virtual device, not a fake USB sensor. PAM integration comes first; the fprintd adapter waits for SEC-004 and a real packaging/security review. |
