@@ -204,12 +204,14 @@ file and a root TTY while changing PAM.
 integration is installed, prefer disabling it through policy rather than editing
 PAM files again:
 
-| State | What it means | Root needed? | Effect |
+| State / action | What it means | Root needed? | Effect |
 |---|---|---|---|
-| Installed + enabled | PAM/polkit/GDM line is present and policy allows the action | Installation: yes. Runtime change: no for the user's own policy | Phone may authenticate this action |
-| Installed + disabled | Line is present, but host policy or phone consent disables the action | No | Module returns unavailable/ignore; normal password path continues |
+| Install integration | Add the PAM/polkit/GDM line, module and service | Yes | Makes the mechanism available |
+| Enable integration | Policy allows the action for a user/device | No for your own policy; yes for global/other users | Phone may authenticate this action |
+| Disable integration | Policy denies the action, or the phone masks it | No for your own policy / phone mask; yes for global/other users | Module is present but the action is not approved |
+| Phone mask | This phone refuses the action | No | Host may still ask; with `sufficient` it falls through to password |
 | Daemon stopped/masked | `phone-authd` is not running; PAM line remains | Yes for systemd mask/stop | Module cannot reach the daemon; password path continues |
-| Uninstalled | `/etc/pam.d` override and, if desired, the module/package are removed | Yes | The integration no longer exists |
+| Uninstall | Remove `/etc/pam.d` override, module and, if desired, package | Yes | The integration no longer exists |
 
 Runtime policy should be the normal switch. It is reversible, auditable, and does
 not risk a broken PAM stack. Uninstall is for cleaning the machine, not for daily
@@ -236,6 +238,35 @@ Recommendations for implementation:
   actions or device-to-user binding changes.
 - Keep a documented uninstall/rollback procedure that restores the original
   `/etc/pam.d` override from the backup created during installation.
+
+### Multi-user hosts
+
+The host identity is the **machine** (`archlinux`), not a Linux account. The
+Linux username is a separate signed field on each request. Pairing should stay
+per host and device; re-pairing the same host with the same device key would
+currently replace the same host record, not create a useful per-user record.
+
+Recommended model:
+
+- The host registry stores an allow-list of Linux users/UIDs per paired device.
+- Pairing defaults to the account that started the host-side pairing; root or a
+  host administrator can add another account later.
+- The phone shows the host as `archlinux` plus **Accounts: desktop, alice** (or
+  the configured labels).
+- The host enforces the allow-list on every request.
+- The phone displays the signed username and may keep a per-account consent
+  toggle. A phone-side deny only narrows; it does not grant another account.
+- A user who wants an independent trust relationship should pair their own phone
+  (a separate device record), not reuse another user's phone silently.
+
+If the phone must enforce the allow-list locally, the host needs to advertise it:
+a `PAIRING_RESULT` account list, a capability/policy message after pairing, or a
+signed `SESSION_HELLO` extension. The host policy remains authoritative even if
+the phone list is stale. This is a protocol addition, not a reason to create a
+host key per user.
+
+Do not model this as `host_id = archlinux/alice`. That would duplicate host
+identity and TLS pins per account and make the machine look like many hosts.
 
 ### Capability IDs, not generic labels
 
@@ -285,6 +316,11 @@ Do these before expanding the platform surface:
 - [ ] Add a root-shell recovery procedure and a PAM rollback test to every
       documented flow.
 - [ ] Add device-user binding and per-user rate limits.
+- [ ] Store an account allow-list per paired device; default to the pairing user,
+      add other accounts through host policy, and show them in the app.
+- [ ] Do not require re-pairing the same host for each Linux user; keep host
+      identity machine-scoped and user identity per request.
+- [ ] Document install/enable/disable/phone-mask/uninstall as distinct states.
 
 ### Phase 2 — Capability protocol v1
 
