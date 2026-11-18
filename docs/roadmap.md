@@ -720,6 +720,9 @@ Do these before expanding the platform surface:
       [Known network issue](#known-network-issue-vpn--tailscale): try all resolved
       addresses, bind sockets to the chosen `Network`, reconnect on VPN/Wi-Fi
       changes, and stop advertising unintended interfaces by default.
+- [ ] Only if LAN + Tailscale are insufficient, evaluate an optional relay or
+      rendezvous path. Prefer an existing transport (Tailscale, WireGuard, SSH)
+      or a minimal protocol-specific relay; do not adopt Syncthing's relay stack.
 - [ ] Provide distro-specific PAM documentation:
       Debian/Ubuntu `common-auth`; Arch `/etc/pam.d/sudo`, `polkit-1`,
       `gdm-password`; Fedora equivalents.
@@ -815,3 +818,5 @@ These are separate adapters, not assumptions that the Linux code is portable.
 | 2026-11-18 | Capability negotiation is a valid separate authenticated message family, not a second unauthenticated protocol. |
 | 2026-11-18 | Polkit/GDM/login integration is opt-in and must be scoped; `sudo` remains the tested integration. |
 | 2026-11-18 | macOS/BSD/iOS are separate adapters with their own threat models; Windows is out of scope. |
+| 2026-11-18 | Do not vendor or port Syncthing code. Reimplement the multi-path/retry behavior from documented concepts; Syncthing is MPL-2.0 and this tree is 0BSD. |
+| 2026-11-18 | A relay/rendezvous fallback is optional. Prefer Tailscale/WireGuard/SSH or a minimal protocol-specific relay over adopting Syncthing's relay stack. |
