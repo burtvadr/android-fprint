@@ -5,13 +5,13 @@ machine. The phone approves with Android's system biometric UI; Linux verifies a
 signature over a fresh challenge instead of trusting a transmitted `YES`.
 
 <p align="center">
-  <a href="media/demo/demo.mp4">
-    <img src="media/demo/demo.gif" width="720" alt="Demo: pairing and fingerprint approval" />
+  <a href="media/demo/demo-v2.mp4">
+    <img src="media/demo/demo-v2.gif" width="720" alt="Demo: pairing and fingerprint approval" />
   </a>
 </p>
 
 <p align="center">
-  <a href="media/demo/demo.mp4">▶ Watch the full demo video</a>
+  <a href="media/demo/demo-v2.mp4">▶ Watch the full demo video</a>
 </p>
 
 <p align="center">
