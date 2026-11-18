@@ -1,24 +1,28 @@
 # Android Remote Biometric Authenticator for Linux
 
-<img src="media/icons/auto/android-fprint-dark.svg" width="128" height="128" alt="Linux Authenticator icon" align="right" />
-
 An Android phone acts as a **remote cryptographic authenticator** for a Linux
 machine. The phone approves with Android's system biometric UI; Linux verifies a
 signature over a fresh challenge instead of trusting a transmitted `YES`.
 
-<br clear="right" />
-
 <p align="center">
-  <video src="media/demo/demo.mp4" controls="controls" width="360"></video>
+  <a href="media/demo/demo.mp4">
+    <img src="media/demo/demo.gif" width="720" alt="Demo: pairing and fingerprint approval" />
+  </a>
 </p>
 
 <p align="center">
-  <a href="media/demo/demo.mp4">▶ Watch the demo</a>
+  <a href="media/demo/demo.mp4">▶ Watch the full demo video</a>
 </p>
 
-| Dark icon | Light icon | Material 3 roles |
-|:---:|:---:|---:|
-| <img src="media/icons/auto/android-fprint-dark.svg" width="88" alt="Dark icon" /> | <img src="media/icons/auto/android-fprint-light.svg" width="88" alt="Light icon" /> | <img src="media/icons/material/m3-roles-preview.svg" width="420" alt="Material 3 fingerprint icon roles" /> |
+<p align="center">
+  <img src="media/icons/auto/android-fprint-dark.svg" width="180" alt="Dark icon" />
+  &nbsp;&nbsp;
+  <img src="media/icons/auto/android-fprint-light.svg" width="180" alt="Light icon" />
+</p>
+
+<p align="center">
+  <img src="media/icons/material/m3-roles-preview.svg" width="600" alt="Material 3 fingerprint icon roles" />
+</p>
 
 ```text
 $ phone-authctl authenticate --user alice --purpose sudo
