@@ -45,6 +45,71 @@ Arch keeps vendor PAM files under `/usr/lib/pam.d`; local overrides belong in
 `system-auth` would affect many services at once and is deliberately not the
 default. Adding it to polkit or GDM must be tested with a root TTY available.
 
+## Known network issue: VPN / Tailscale
+
+Observed on the test setup:
+
+- The PC runs Tailscale all the time.
+- The phone and PC are on the same Wi-Fi; pairing and authentication work with
+  Tailscale off on the phone.
+- Turning Tailscale **on** on the phone makes this app stop working.
+- Syncthing on the same phone continues to work normally.
+
+This is our bug, not a Tailscale bug. The network path is available; the app does
+not choose it correctly.
+
+Likely causes in the current code:
+
+- The host binds `0.0.0.0` and mDNS uses `enable_addr_auto()`, so it publishes
+  **every** host address, including the Tailscale `100.x` address. The phone may
+  resolve the service to the Tailscale address, the LAN address, or both.
+- Android `NsdServiceInfo` is reduced to a single `host` in
+  `WifiTransport.discover()`. The app tries that one address and has no fallback
+  to the other A/AAAA records.
+- `WifiTransport.connect()` creates an unbound `Socket()`, so Android selects the
+  default network/VPN route. The app never requests the Wi-Fi `Network` or binds
+  the socket to it.
+- There is no `NetworkCallback`. Addresses and connections are not re-resolved
+  when Wi-Fi, VPN or the default network changes.
+- Syncthing works because it binds/listens on multiple interfaces, retries
+  addresses, and reconnects; the fact that it continues does not mean Tailscale
+  permits arbitrary LAN traffic.
+
+Required behavior:
+
+- Enumerate every resolved host address and try them in a defined order, with a
+  short per-address timeout. The default order should be **LAN first**, then
+  Tailscale, unless policy says otherwise.
+- Use `ConnectivityManager` to obtain the Wi-Fi and VPN `Network` objects and
+  bind the data socket with `Network.bindSocket()` before connecting. Choose the
+  network that matches the address being tried.
+- Register `NetworkCallback` and re-resolve/reconnect on `onAvailable`,
+  `onLost`, `onCapabilitiesChanged` and VPN changes.
+- Do not publish the Tailscale interface over mDNS by default for local pairing.
+  Add a host option such as `--advertise-address` / `--mdns-interface`, or bind
+  the daemon to a specific LAN address when that is the intended deployment.
+- Make the path policy explicit, for example `--transport-preference lan`,
+  `tailscale` or `auto`. Address selection must never weaken TLS pinning or the
+  signed transcript; it only decides where bytes are sent.
+- Surface diagnostics: the phone should log which address/network it chose and
+  why, and `phone-authctl status`/`devices` should show the host's listen
+  addresses.
+
+Do not make “disable Tailscale” or “allow local network access” the only
+documented fix. Those are workarounds; the app should coexist with a VPN.
+
+Acceptance criteria:
+
+- [ ] Pairing and authentication work with the PC's Tailscale up and the phone's
+      Tailscale on, over the LAN.
+- [ ] Authentication works over Tailscale `100.x` when policy allows it and the
+      phone has Tailscale on.
+- [ ] Toggling Tailscale or switching Wi-Fi reconnects without restarting the app.
+- [ ] mDNS does not advertise unintended interfaces by default.
+- [ ] All resolved addresses are tried, with a bounded timeout each.
+- [ ] Tests cover VPN on/off on the phone and Tailscale up on the host; address
+      choice remains a routing decision, not an authentication decision.
+
 ## What "supported" means
 
 A platform is supported only when it has:
@@ -614,6 +679,10 @@ Do these before expanding the platform surface:
 - [ ] Implement the adb-like pairing and device UX described in
       [CLI and pairing UX](#cli-and-pairing-ux): one code line, no default
       confirmation prompt, truthful completion, `devices --json`, `unpair`.
+- [ ] Fix VPN/Tailscale coexistence as described in
+      [Known network issue](#known-network-issue-vpn--tailscale): try all resolved
+      addresses, bind sockets to the chosen `Network`, reconnect on VPN/Wi-Fi
+      changes, and stop advertising unintended interfaces by default.
 - [ ] Provide distro-specific PAM documentation:
       Debian/Ubuntu `common-auth`; Arch `/etc/pam.d/sudo`, `polkit-1`,
       `gdm-password`; Fedora equivalents.
