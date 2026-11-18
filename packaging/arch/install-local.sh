@@ -13,7 +13,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 STATE_FROM=""
 PAM_FILE="/etc/pam.d/sudo"
-PAM_LINE="auth        sufficient    pam_phone_auth.so purpose=sudo debug"
+PAM_LINE="auth        sufficient    pam_phone_auth.so purpose=sudo"
 
 usage() {
     cat <<EOF
