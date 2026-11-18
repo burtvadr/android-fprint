@@ -55,6 +55,29 @@ system into an accidental phone-only machine.
 local `fprintd` sensor. GDM's existing fingerprint path (`gdm-fingerprint` +
 `pam_fprintd`) is separate and must keep working.
 
+### First step: screen unlock
+
+GNOME's screen lock uses the same `gdm-password` PAM service as the GDM password
+login (confirmed in the journal as `gdm-password`). That makes it the smallest
+end-to-end win and avoids touching `system-auth`:
+
+```bash
+sudo ./packaging/arch/pam-gdm-phone.sh --dry-run
+sudo ./packaging/arch/pam-gdm-phone.sh
+```
+
+Then lock with `Super+L`, press Enter or submit the password form, and approve
+the phone prompt. The script keeps a backup and supports:
+
+```bash
+sudo ./packaging/arch/pam-gdm-phone.sh --rollback
+```
+
+Keep a root TTY open. The existing session keyring is already unlocked when you
+started the session with a password, so screen unlock does not need a new keyring
+password. A cold GDM login with phone-only authentication may still leave the
+login keyring locked; that is a separate problem.
+
 ### Scope
 
 - GDM password login.
