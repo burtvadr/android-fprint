@@ -98,6 +98,43 @@ Required behavior:
 Do not make “disable Tailscale” or “allow local network access” the only
 documented fix. Those are workarounds; the app should coexist with a VPN.
 
+### What Syncthing does differently
+
+Syncthing has no Tailscale-specific rule. It is robust because it treats the
+network as a set of candidates and keeps retrying. The relevant mechanisms in its
+source:
+
+- **Enumerate interfaces on every announcement.** `lib/beacon/broadcast.go`
+  sends an IPv4 broadcast on each running broadcast interface;
+  `lib/beacon/multicast.go` sends IPv6 multicast per interface. Both skip
+  Android point-to-point interfaces (cellular) and fall back to the general
+  broadcast address when interface enumeration fails.
+- **Announce more than one address.** `lib/discover/local.go` broadcasts every
+  30 seconds and keeps discovery results for 90 seconds, so addresses can change
+  without a restart. `lib/connections/service.go` publishes both LAN and WAN
+  addresses (`AnnounceLANAddresses`, default true).
+- **Rank paths instead of hardcoding one.** `lib/config/optionsconfiguration.go`
+  defaults to LAN TCP 10, LAN QUIC 20, WAN TCP 30, WAN QUIC 40, relay 50.
+  `lib/connections/service.go` tries the lowest priority first and only falls
+  back to worse paths. A point-to-point VPN is classified as non-LAN by
+  `lib/osutil/net.go`, not rejected.
+- **Dial candidates in parallel.** Within one priority bucket,
+  `lib/connections/service.go::dialParallel` dials up to 8 targets per device
+  concurrently, each with a 10 second timeout (`lib/connections/tcp_dial.go`),
+  and keeps the first usable connection.
+- **Retry forever.** `ReconnectIntervalS` defaults to 20 seconds; discovery is
+  re-broadcast every 30 seconds. A failed address is retried later, not treated
+  as permanent.
+- **Try both routing styles.** `lib/dialer/public.go` dials once reusing the
+  listen port and once without it, because route selection can differ. It also
+  keeps a relay path as a last resort.
+
+The design lesson is simple: **do not pick one address and stop.** Publish every
+candidate, prefer LAN, try the alternatives, and re-learn after a network change.
+Our protocol does not need Syncthing's relay: LAN plus Tailscale/`100.x` covers
+the same fallback role for this deployment.
+
+
 Acceptance criteria:
 
 - [ ] Pairing and authentication work with the PC's Tailscale up and the phone's
