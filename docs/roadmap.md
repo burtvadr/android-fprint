@@ -259,6 +259,17 @@ Required tests:
 - [ ] If the password prompt does not return, treat it as a bug in our PAM
       integration, not a GNOME limitation.
 
+The PAM module now sends a best-effort `PAM_TEXT_INFO` message:
+
+```text
+Check your phone to approve this request.
+```
+
+Terminals and some PAM consumers display it. GDM's lock screen may ignore
+`PAM_TEXT_INFO`; that part is a GDM conversation behavior. The message is
+harmless if dropped and is still visible in the journal. It is not a substitute
+for a visible authentication method.
+
 Possible improvements, in order:
 
 1. Keep the lock-screen timeout short (5 s by default) and configurable with

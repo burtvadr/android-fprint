@@ -18,7 +18,7 @@
 
 pub mod ipc;
 
-use std::ffi::{c_char, c_int, c_void, CStr};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 
 /// PAM return values, defined here rather than linked so the module has no build
 /// dependency on `libpam`. The values are fixed by the PAM API.
@@ -26,6 +26,8 @@ pub mod pam {
     use std::ffi::c_int;
 
     pub const PAM_SUCCESS: c_int = 0;
+    /// `PAM_TEXT_INFO`: a message for the user, not a prompt for input.
+    pub const PAM_TEXT_INFO: c_int = 4;
     pub const PAM_AUTH_ERR: c_int = 7;
     pub const PAM_AUTHINFO_UNAVAIL: c_int = 9;
     /// libpam's `PAM_USER_ERR`: no user was established.
@@ -49,6 +51,13 @@ extern "C" {
         prompt: *const c_char,
     ) -> c_int;
     fn pam_syslog(pamh: *const PamHandle, priority: c_int, fmt: *const c_char, ...);
+    fn pam_prompt(
+        pamh: *const PamHandle,
+        style: c_int,
+        response: *mut *mut c_char,
+        fmt: *const c_char,
+        ...
+    ) -> c_int;
 }
 
 const PAM_SERVICE: c_int = 1; // PAM_SERVICE
@@ -213,6 +222,23 @@ fn pam_service(pamh: *const PamHandle) -> String {
     String::new()
 }
 
+/// Sends a best-effort informational message to the PAM conversation.
+///
+/// This is how a terminal or greeter can tell the user to check the phone. GDM's
+/// lock screen may ignore `PAM_TEXT_INFO`; in that case this is harmless and the
+/// message remains in the journal. It is not an authentication result and is
+/// never required for the module to work.
+fn pam_info(pamh: *const PamHandle, message: &str) {
+    let Ok(c) = CString::new(message) else {
+        return;
+    };
+    // `pam_prompt` is a variadic extension; the format string has no `%` and no
+    // arguments. The response pointer is null because this is informational.
+    unsafe {
+        let _ = pam_prompt(pamh, pam::PAM_TEXT_INFO, std::ptr::null_mut(), c.as_ptr());
+    }
+}
+
 /// Logs through `pam_syslog`, which handles a null handle.
 fn syslog(pamh: *const PamHandle, priority: c_int, message: &str) {
     let c = match std::ffi::CString::new(message) {
@@ -282,6 +308,10 @@ pub unsafe extern "C" fn pam_sm_authenticate(
     if !service.is_empty() {
         opts.service = service;
     }
+
+    // Best effort: tell the user on the host to look at the phone. Some PAM
+    // consumers display this; GDM's lock screen may not.
+    pam_info(pamh, "Check your phone to approve this request.");
 
     let decision = authenticate(&ipc::default_socket(), &user, &opts);
     if debug {
