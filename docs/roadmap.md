@@ -177,6 +177,41 @@ If polkit's PAM runs as root on this Arch version, the immediate work is only
 group/socket testing. If it runs as polkitd, the trusted-service policy is a
 prerequisite.
 
+### Before polkit: questions to answer first
+
+Do not install the `polkit-1` line until these are answered with evidence from
+the live machine:
+
+- [ ] Which process runs PAM for `pkexec`/`systemctl`? Is it
+      `polkit-agent-helper-1`, `pkexec`, or polkitd? What UID does it run as?
+- [ ] Can that process reach `/run/phone-authd/control.sock` (root, group, ACL)?
+- [ ] Does `authorize_caller` accept the caller/target pair? A helper running as
+      the desktop user can ask for that user; a helper running as polkitd cannot
+      ask for desktop without an explicit trusted-service policy.
+- [ ] Is the PAM service actually `polkit-1`, and is there a local
+      `/etc/pam.d/polkit-1` override, or only the vendor file under
+      `/usr/lib/pam.d`?
+- [ ] Which concrete action was tested (`pkexec ...`, `systemctl restart ...`)?
+      Some `systemctl` operations do not authenticate at all.
+- [ ] Does the phone show the target user, `purpose=polkit`, and the operation?
+- [ ] Does cancel/timeout fall back to the polkit password dialog?
+- [ ] Does `PAM_TEXT_INFO` appear in the polkit dialog, or is it dropped?
+- [ ] Is this single-user only? Root-targeting polkit actions require SEC-004
+      ownership/`allow_root` before they are safe on a shared machine.
+- [ ] Is there a rollback file and a root TTY? Do not edit `system-auth`.
+
+Read-only recon before changing anything:
+
+```bash
+cat /usr/lib/pam.d/polkit-1
+ls -l /usr/lib/polkit-1/polkit-agent-helper-1
+# trigger one pkexec/systemctl authentication, then:
+journalctl -b --no-pager | grep -i 'polkit\|pam_unix\|pam_phone'
+```
+
+The PAM message added for GDM is best-effort and consumer-specific. It is not a
+reason to assume the polkit dialog will display it.
+
 ### Prompt quality
 
 The phone prompt must show enough to make a correct decision:
