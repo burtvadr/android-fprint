@@ -473,6 +473,9 @@ Do these before expanding the platform surface:
 
 - [x] SEC-001: bind the pairing code to an ephemeral ECDH secret and the full
       transcript; add the MITM regression test. A PAKE remains a future upgrade.
+- [ ] Pairing upgrade: replace the six-digit SAS with CPace/SPAKE2 or a
+      high-entropy QR/NFC secret. Keep ECDH + SAS until a reviewed implementation
+      ships; do not hand-roll a PAKE in Kotlin.
 - [ ] SEC-003: stop recommending global `common-auth`; scope PAM integration and
       add number matching for authentication.
 - [ ] SEC-004: bind each paired device to allowed Linux users; deny root by

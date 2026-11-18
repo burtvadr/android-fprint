@@ -41,7 +41,7 @@ Authenticated.
 | Component | State |
 |---|---|
 | Protocol specification | complete, normative |
-| Rust implementation | complete, 198 tests |
+| Rust implementation | complete, 200 tests |
 | Kotlin implementation | complete, 124 cross-language conformance checks |
 | `phone-authd` | working end to end: pairing, challenge/response, verification, revocation |
 | `phone-authctl` | working |
@@ -63,7 +63,7 @@ make verify       # everything above (Rust + Kotlin vectors + end to end)
 make android-all  # Android lint, unit tests, debug APK (needs ANDROID_HOME)
 ```
 
-Latest run: 198 Rust tests pass with no clippy warnings; the Kotlin runner agrees
+Latest run: 200 Rust tests pass with no clippy warnings; the Kotlin runner agrees
 with Rust on 124 checks; the end-to-end smoke test passes; the Android app lints
 clean, passes 31 unit tests, builds a debug APK, and has been exercised end to end
 on a physical phone in the foreground and in the background.

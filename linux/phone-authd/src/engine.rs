@@ -445,7 +445,7 @@ impl Engine {
             // The session holds an ephemeral ECDH key. Nothing is derived and no
             // code exists until the device's `PAIRING_SUBMIT` arrives with its
             // own ephemeral key, so there is no provisional public-nonce code.
-            let session = PairingSession::new(session_id, host_nonce);
+            let session = PairingSession::new_with_mode(session_id, host_nonce, code_entry);
             let chosen: Option<String> = match code {
                 Some(c) => {
                     if c.len() != android_fprint_protocol::types::PAIRING_CODE_DIGITS
@@ -546,8 +546,8 @@ impl Engine {
     /// In [`CodeEntry::Device`] mode the host displays the code and the phone
     /// verifies the typed value, so no code is needed here. In
     /// [`CodeEntry::Host`] mode the phone displays the code, and the host MUST
-    /// prove it was typed by supplying it; a wrong value leaves the session open
-    /// for a retry and never persists anything.
+    /// prove it was typed by supplying it. A wrong value cancels the session
+    /// immediately: one comparison attempt per exchange.
     pub fn confirm_pairing_with_code(&self, entered_code: Option<&str>) -> Result<()> {
         let notify = {
             let mut g = self
@@ -575,10 +575,14 @@ impl Engine {
                         expected.as_bytes(),
                     )
                 {
+                    // A mismatch is terminal: no retry inside the same exchange.
+                    // Retrying would turn the six-digit check into an online
+                    // guessing oracle and keep a half-open session alive.
+                    let _ = g.take();
                     self.audit
                         .write(&Event::new("pairing_code_mismatch").denied("CONTEXT_MISMATCH"));
                     return Err(ProtocolError::ContextMismatch(
-                        "the entered pairing code does not match".into(),
+                        "the entered pairing code does not match; pairing cancelled".into(),
                     ));
                 }
                 self.audit.write(&Event::new("pairing_code_verified"));

@@ -308,6 +308,10 @@ transcript = session_id || host_id || device_id
            || host_pubkey || device_pubkey
            || host_nonce || device_nonce
            || host_eph_pubkey || device_eph_pubkey
+           || code_entry_byte
+
+code_entry_byte = 0x00 for `code_entry = device`
+                = 0x01 for `code_entry = host`
 
 ecdh_secret = X-coordinate of (host_eph_private * device_eph_pubkey)
             = X-coordinate of (device_eph_private * host_eph_pubkey)
@@ -352,13 +356,15 @@ Requirements:
   explicit positive confirmation from its operator before persisting. When
   `code_entry = host`, it MUST NOT display the code, MUST require its operator to
   type the code shown on the phone, and MUST verify that entry before persisting;
-  a wrong entry MUST be rejected and MUST NOT be converted into a default or a
-  successful pairing.
+  a wrong entry MUST be rejected, MUST NOT be converted into a default or a
+  successful pairing, and MUST cancel the session. There is no retry within the
+  same exchange.
 * The device MUST verify `host_mac` before persisting the host key. When
   `code_entry = device`, it MUST NOT display the code, MUST require the operator
   to type the code displayed by the host, and MUST persist only on an exact match.
-  A wrong entry MUST be rejected without persisting; the operator MAY retry until
-  expiry. When `code_entry = host`, the device MAY display the code for the host
+  A wrong entry MUST be rejected without persisting and MUST discard the pending
+  result; the operator must start a new pairing session. When `code_entry = host`,
+  the device MAY display the code for the host
   operator to type, but it MUST still require an explicit **Allow** before
   persisting.
 * **Cancel**, the back gesture, expiry, timeout, or loss of the pairing link MUST

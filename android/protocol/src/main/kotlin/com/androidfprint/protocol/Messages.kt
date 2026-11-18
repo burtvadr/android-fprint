@@ -740,6 +740,7 @@ class PairingSession private constructor(
     val sessionId: Id,
     val hostNonce: ByteArray,
     val hostEphPublicKey: ByteArray,
+    val codeEntry: CodeEntry,
     private val deviceKeyPair: KeyPair,
 ) {
     private var deviceNonce: ByteArray? = null
@@ -751,10 +752,16 @@ class PairingSession private constructor(
         encodeEcpPublicKey(deviceKeyPair.public as ECPublicKey)
     }
 
-    constructor(sessionId: Id, hostNonce: ByteArray, hostEphPublicKey: ByteArray) : this(
+    constructor(
+        sessionId: Id,
+        hostNonce: ByteArray,
+        hostEphPublicKey: ByteArray,
+        codeEntry: CodeEntry = CodeEntry.DEVICE,
+    ) : this(
         sessionId,
         hostNonce,
         hostEphPublicKey,
+        codeEntry,
         generateP256KeyPair(),
     )
 
@@ -841,7 +848,8 @@ class PairingSession private constructor(
         devicePub: ByteArray,
         deviceNonce: ByteArray,
     ): ByteArray = sessionId.bytes + hostId.bytes + deviceId.bytes + hostPub + devicePub +
-        hostNonce + deviceNonce + hostEphPublicKey + deviceEphemeralPublicKey
+        hostNonce + deviceNonce + hostEphPublicKey + deviceEphemeralPublicKey +
+        byteArrayOf(codeEntryByte())
 
     private fun checkedTranscript(
         hostId: Id,
@@ -883,6 +891,12 @@ class PairingSession private constructor(
             checkedTranscript(hostId, deviceId, hostPub, devicePub),
     )
 
+    /** Stable transcript byte for the code-entry mode. */
+    private fun codeEntryByte(): Byte = when (codeEntry) {
+        CodeEntry.DEVICE -> 0
+        CodeEntry.HOST -> 1
+    }
+
     companion object {
         /**
          * Deterministic ephemeral key for conformance vectors only. Production
@@ -894,6 +908,7 @@ class PairingSession private constructor(
             hostEphPublicKey: ByteArray,
             scalar: ByteArray,
             publicKey: ByteArray,
+            codeEntry: CodeEntry = CodeEntry.DEVICE,
         ): PairingSession {
             require(scalar.size == 32) { "ephemeral scalar must be 32 bytes" }
             val params = p256Params()
@@ -902,7 +917,13 @@ class PairingSession private constructor(
             val public = decodeEcpPublicKey(publicKey)
             val private = KeyFactory.getInstance("EC")
                 .generatePrivate(ECPrivateKeySpec(d, params))
-            return PairingSession(sessionId, hostNonce, hostEphPublicKey, KeyPair(public, private))
+            return PairingSession(
+                sessionId,
+                hostNonce,
+                hostEphPublicKey,
+                codeEntry,
+                KeyPair(public, private),
+            )
         }
     }
 }

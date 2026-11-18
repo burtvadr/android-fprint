@@ -689,18 +689,20 @@ async fn host_entry_mode_requires_the_correct_code_before_persisting() {
         engine.list_devices().is_empty(),
         "a wrong code must not create a device record"
     );
-
-    engine
-        .confirm_pairing_with_code(Some(&correct))
-        .expect("the correct host-entered code is accepted");
-    sim.await.expect("device task");
-    conn.await
-        .expect("connection task")
-        .expect("connection closed cleanly");
-    assert_eq!(
-        engine.device_status(&device.device_id),
-        Some(DeviceStatus::Paired)
+    assert!(
+        engine.pairing_code().is_none(),
+        "a wrong code must cancel the pairing session, not leave it open for retries"
     );
+    let retry = engine
+        .confirm_pairing_with_code(Some(&correct))
+        .expect_err("a retry in the same exchange must be refused");
+    assert_eq!(retry.code(), ErrorCode::NotPaired);
+
+    // The connection and simulator are still waiting for a result; cancel them.
+    conn.abort();
+    sim.abort();
+    let _ = conn.await;
+    let _ = sim.await;
 }
 
 #[tokio::test]

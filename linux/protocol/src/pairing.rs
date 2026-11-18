@@ -27,6 +27,9 @@ pub struct PairingSession {
     pub device_nonce: [u8; CHALLENGE_LEN],
     /// Public half of the host's ephemeral ECDH key, sent in `PAIRING_START`.
     pub host_eph_public: [u8; PUBKEY_LEN],
+    /// Which endpoint types the code. Bound into the transcript so an attacker
+    /// cannot flip the mode while preserving the code.
+    pub code_entry: CodeEntry,
     /// Public half of the device's ephemeral ECDH key, sent in `PAIRING_SUBMIT`.
     pub device_eph_public: Option<[u8; PUBKEY_LEN]>,
     /// Host-side ephemeral private key. Consumed on first derivation.
@@ -42,10 +45,20 @@ impl PairingSession {
     /// [`PairingSession::derive_with_device_ephemeral`] completes it once the
     /// device's public key and ephemeral key arrive.
     pub fn new(session_id: Id, host_nonce: [u8; CHALLENGE_LEN]) -> PairingSession {
-        Self::with_host_ephemeral(
+        Self::new_with_mode(session_id, host_nonce, CodeEntry::Device)
+    }
+
+    /// Host side with a fresh ephemeral key and an explicit code-entry mode.
+    pub fn new_with_mode(
+        session_id: Id,
+        host_nonce: [u8; CHALLENGE_LEN],
+        code_entry: CodeEntry,
+    ) -> PairingSession {
+        Self::with_host_ephemeral_mode(
             session_id,
             host_nonce,
             P256SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng),
+            code_entry,
         )
     }
 
@@ -57,12 +70,23 @@ impl PairingSession {
         host_nonce: [u8; CHALLENGE_LEN],
         host_eph_secret: P256SecretKey,
     ) -> PairingSession {
+        Self::with_host_ephemeral_mode(session_id, host_nonce, host_eph_secret, CodeEntry::Device)
+    }
+
+    /// Host side with an explicit code-entry mode bound into the transcript.
+    pub fn with_host_ephemeral_mode(
+        session_id: Id,
+        host_nonce: [u8; CHALLENGE_LEN],
+        host_eph_secret: P256SecretKey,
+        code_entry: CodeEntry,
+    ) -> PairingSession {
         let host_eph_public = encode_public_key(&host_eph_secret);
         PairingSession {
             session_id,
             host_nonce,
             device_nonce: [0u8; CHALLENGE_LEN],
             host_eph_public,
+            code_entry,
             device_eph_public: None,
             host_eph_secret: Some(host_eph_secret),
             secret: [0u8; 32],
@@ -88,6 +112,7 @@ impl PairingSession {
         device_id: &Id,
         device_pubkey: &PublicKey,
         device_nonce: [u8; CHALLENGE_LEN],
+        code_entry: CodeEntry,
     ) -> Result<PairingSession> {
         let device_eph_secret = P256SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
         let device_eph_public = encode_public_key(&device_eph_secret);
@@ -96,6 +121,7 @@ impl PairingSession {
             host_nonce,
             device_nonce,
             host_eph_public,
+            code_entry,
             device_eph_public: Some(device_eph_public),
             host_eph_secret: None,
             secret: [0u8; 32],
@@ -226,6 +252,7 @@ impl PairingSession {
         t.extend_from_slice(&self.device_nonce);
         t.extend_from_slice(&self.host_eph_public);
         t.extend_from_slice(device_eph_public);
+        t.push(self.code_entry.as_byte());
         t
     }
 
@@ -378,6 +405,14 @@ pub enum CodeEntry {
 }
 
 impl CodeEntry {
+    /// Stable transcript byte. Must not change without a protocol version bump.
+    pub fn as_byte(self) -> u8 {
+        match self {
+            Self::Device => 0,
+            Self::Host => 1,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Device => "device",
@@ -827,6 +862,7 @@ mod tests {
             &device_id,
             &device_sk.public_key(),
             [3u8; 32],
+            CodeEntry::Device,
         )
         .unwrap();
         let phone_code = phone_view.code().unwrap();
@@ -834,6 +870,61 @@ mod tests {
         assert_ne!(
             host_code, phone_code,
             "an on-path key substitution produced the same code on both endpoints"
+        );
+    }
+
+    #[test]
+    fn host_ephemeral_key_is_fresh_per_session() {
+        let a = PairingSession::new(Id::from_slice(&[1u8; 16]).unwrap(), [2u8; 32]);
+        let b = PairingSession::new(Id::from_slice(&[1u8; 16]).unwrap(), [2u8; 32]);
+        assert_ne!(
+            a.host_eph_public, b.host_eph_public,
+            "pairing must not reuse an ephemeral key across sessions"
+        );
+    }
+
+    #[test]
+    fn code_is_bound_to_the_code_entry_mode() {
+        let (h, d) = keys();
+        let (hid, did) = ids();
+        let dev_eph = P256SecretKey::from_slice(&[4u8; 32]).unwrap();
+        let dev_eph_pub = encode_public_key(&dev_eph);
+
+        let mut device = PairingSession::new_with_mode(
+            Id::from_slice(&[1u8; 16]).unwrap(),
+            [2u8; 32],
+            CodeEntry::Device,
+        );
+        device
+            .derive_with_device_ephemeral(
+                &hid,
+                &did,
+                &h.public_key(),
+                &d.public_key(),
+                [3u8; 32],
+                dev_eph_pub,
+            )
+            .unwrap();
+
+        let mut host = PairingSession::new_with_mode(
+            Id::from_slice(&[1u8; 16]).unwrap(),
+            [2u8; 32],
+            CodeEntry::Host,
+        );
+        host.derive_with_device_ephemeral(
+            &hid,
+            &did,
+            &h.public_key(),
+            &d.public_key(),
+            [3u8; 32],
+            dev_eph_pub,
+        )
+        .unwrap();
+
+        assert_ne!(
+            device.code().unwrap(),
+            host.code().unwrap(),
+            "flipping code_entry must change the verification code"
         );
     }
 

@@ -53,8 +53,8 @@ key under the new transcript binding.
 Three properties are worth calling out.
 
 **The code is derived, not transported.** It is a function of an ephemeral ECDH
-secret over the full transcript: both ids, both long-term keys, both nonces and
-both ephemeral keys. The host cannot compute it before the device contributes
+secret over the full transcript: both ids, both long-term keys, both nonces,
+both ephemeral keys and the code-entry mode. The host cannot compute it before the device contributes
 its ephemeral public key, and the device must not reveal its nonce before it knows
 an operator is deliberately pairing. So the exchange is necessarily two rounds,
 and both sides compute the code independently.
@@ -70,9 +70,9 @@ prove that a human was involved. The Android app's gate depends on `code_entry`:
 
 * **`device` mode (default):** the phone never displays the code. It parks the
   verified pairing in `PairingAwaitingConfirmation` and asks the operator to type
-  the six-digit code shown on the Linux screen. A wrong value is rejected and can
-  be retried until the pairing expires. Typing the correct code is the consent;
-  there is no separate Allow tap.
+  the six-digit code shown on the Linux screen. A wrong value cancels the pairing;
+  start a new session rather than retrying against the same exchange. Typing the
+  correct code is the consent; there is no separate Allow tap.
 * **`host` mode:** the phone displays the code for the Linux operator to type.
   After the host proves it derived the same transcript, the phone still requires
   an explicit **Allow**. The code entry is a host-side check, not a substitute

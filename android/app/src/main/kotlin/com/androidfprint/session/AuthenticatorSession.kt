@@ -498,6 +498,7 @@ class AuthenticatorSession(
                 start.sessionId,
                 start.hostNonce,
                 start.hostEphPublicKey,
+                start.codeEntry,
             )
             session.derive(
                 start.hostId,
@@ -650,6 +651,10 @@ class AuthenticatorSession(
                     pending.code.toByteArray(Charsets.US_ASCII),
                 )
             ) {
+                // One comparison per pairing exchange. A retry would be an online
+                // guessing oracle, so a wrong code cancels the whole attempt.
+                rejectPairing()
+                fail("incorrect pairing code; pairing cancelled")
                 return false
             }
         }

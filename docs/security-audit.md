@@ -142,12 +142,14 @@ matched this.
 ```text
 transcript = session_id || host_id || device_id || host_pubkey || device_pubkey
           || host_nonce || device_nonce || host_eph_pubkey || device_eph_pubkey
+          || code_entry_byte
 pairing_secret = HKDF(ECDH_X, "ALP-PAIR-SALT-V1",
                       "ALP-PAIR-TRANSCRIPT-V2" || transcript)
 p = HMAC(pairing_secret, "ALP-PAIR-V1" || 0x00 || transcript)
 ```
 
-The code, `device_mac` and `host_mac` all cover that transcript. Substituting
+The transcript also includes the `code_entry` mode byte (`0` = phone types,
+`1` = host types). The code, `device_mac` and `host_mac` all cover that transcript. Substituting
 either endpoint's long-term or ephemeral key changes the ECDH result and the
 transcript, so the two endpoints derive different codes and MACs. Both ephemeral
 private keys are zeroized after derivation. `PairingSession::checked_transcript`
@@ -160,7 +162,12 @@ refuses to MAC a transcript other than the one the secret was bound to.
   host and phone codes differ.
 - `::code_is_bound_to_the_public_keys` changes only the device key and asserts the
   code changes.
+- `::host_ephemeral_key_is_fresh_per_session` asserts a new ECDH key per attempt.
+- `::code_is_bound_to_the_code_entry_mode` asserts flipping who types the code
+  changes the verification value.
 - `::code_changes_with_the_device_nonce`, `::macs_verify_and_detect_substitution`.
+- `host_entry_mode_requires_the_correct_code_before_persisting` now asserts a
+  wrong code cancels the session and a retry is refused.
 - The Kotlin device side reproduces the Rust code and MACs through the shared
   vectors (`make vectors-kt`), including the new ephemeral keys.
 
@@ -614,7 +621,7 @@ normative behaviour or the table is; update the other.
 **Status:** Resolved  
 **Affected:** `README.md`
 
-The review mentioned 188/168 tests. The current tree reports 198 Rust tests and
+The review mentioned 188/168 tests. The current tree reports 200 Rust tests and
 31 Android unit tests; lint, vectors and the end-to-end smoke test pass. The
 review was working from an older snippet. Keep the counts in the README updated
 when the suite changes.

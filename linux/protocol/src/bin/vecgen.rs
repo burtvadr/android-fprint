@@ -744,6 +744,7 @@ fn main() {
                 "private_scalar_hex": hexs(&device_eph_sk.to_bytes()),
                 "public_key_hex": hexs(&device_eph_pub),
             },
+            "code_entry": "device",
             "code": code,
             "host_key": {
                 "public_key_hex": hexs(host_pk.as_bytes()),

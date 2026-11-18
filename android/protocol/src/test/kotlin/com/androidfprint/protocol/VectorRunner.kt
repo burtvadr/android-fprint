@@ -318,6 +318,7 @@ class VectorRunner(private val vectorsDir: File) {
             hostEphPublicKey = hostEph,
             scalar = Hex.decode(doc.obj("device_ephemeral").text("private_scalar_hex")),
             publicKey = Hex.decode(doc.obj("device_ephemeral").text("public_key_hex")),
+            codeEntry = CodeEntry.fromWire(doc.text("code_entry")),
         )
         s.derive(
             hostId = hostId,

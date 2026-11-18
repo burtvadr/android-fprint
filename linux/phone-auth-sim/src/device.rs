@@ -381,6 +381,7 @@ where
             &self.device.device_id,
             &self.device.public_key(),
             device_nonce,
+            start.code_entry,
         )?;
 
         // Both screens show a code derived from the same ephemeral ECDH secret
