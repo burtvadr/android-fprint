@@ -189,6 +189,46 @@ The phone prompt must show enough to make a correct decision:
 The prompt must not show an unsigned display name as the host identity. Account
 and operation come from the signed request context.
 
+### Waiting, fallback and the “looks broken” problem
+
+The lock screen test now works, but the host shows no visible “check your phone”
+message while PAM waits. That is a real UX gap, not an authentication failure.
+
+Current behavior:
+
+- PAM calls the phone module first.
+- If the phone is paired and connected but not answered, the module waits up to
+  `timeout_ms` (15 s in the gdm line).
+- If the daemon has no connected device, it should return quickly and fall
+  through to the password.
+- The line is `sufficient`, so a timeout/unavailable result must continue to
+  `pam_unix`. The user is not permanently stuck.
+
+Ownership of the problem:
+
+- **Ours:** the timeout choice, the lack of a fast “no phone connected” path, and
+  the fact that the module does not emit a visible PAM message.
+- **GNOME/GDM:** the lock-screen UI does not expose a generic “phone
+  authenticator” method or a clear waiting indicator. A native fprintd adapter
+  would show a device, but that is a larger future project.
+
+Required tests:
+
+- [ ] Lock with the phone powered off or in airplane mode. Press Enter. Confirm
+      the password prompt appears after the timeout, not a dead screen.
+- [ ] Lock with the phone connected but not approved. Confirm the same fallback.
+- [ ] Lock with the daemon stopped. Confirm fallback is immediate.
+- [ ] If the password prompt does not return, treat it as a bug in our PAM
+      integration, not a GNOME limitation.
+
+Possible improvements, in order:
+
+1. Lower the lock-screen timeout to 8–10 s; keep it configurable.
+2. Add a fast pre-check so an unpaired/disconnected phone returns immediately.
+3. Emit a PAM info message asking the user to check the phone, if GDM displays it.
+4. Document the wait in the UI/README.
+5. Only then consider a native fprintd-compatible device or a GNOME UI patch.
+
 ### Safety and rollback
 
 - Keep a root TTY open for every PAM experiment.
