@@ -12,6 +12,7 @@ VENDOR="/usr/lib/pam.d/gdm-password"
 TARGET="/etc/pam.d/gdm-password"
 RECORD="/etc/pam.d/.gdm-password.phone.rollback"
 LINE="auth        sufficient    pam_phone_auth.so purpose=gdm timeout_ms=15000"
+TMP_FILE=""
 
 usage() {
     cat <<EOF
@@ -78,9 +79,8 @@ main() {
     local base="$VENDOR"
     [ -f "$TARGET" ] && base="$TARGET"
 
-    local tmp
-    tmp="$(mktemp)"
-    trap 'rm -f "$tmp"' EXIT
+    TMP_FILE="$(mktemp)"
+    trap 'rm -f "${TMP_FILE:-}"' EXIT
 
     if ! awk -v line="$LINE" '
         BEGIN { inserted = 0 }
@@ -90,14 +90,14 @@ main() {
         }
         { print }
         END { if (!inserted) exit 42 }
-    ' "$base" > "$tmp"; then
+    ' "$base" > "$TMP_FILE"; then
         echo "Could not find 'auth include system-local-login' in $base." >&2
         echo "No change made. Inspect the file before trying a manual edit." >&2
         exit 1
     fi
 
     echo "==> proposed change"
-    diff -u "$base" "$tmp" || true
+    diff -u "$base" "$TMP_FILE" || true
 
     if [ "$dry_run" -eq 1 ]; then
         echo
@@ -111,7 +111,7 @@ main() {
         cp -a "$TARGET" "$backup"
     fi
 
-    install -m 0644 -o root -g root "$tmp" "$TARGET"
+    install -m 0644 -o root -g root "$TMP_FILE" "$TARGET"
     {
         echo "PHONE_BACKUP=$backup"
     } > "$RECORD"
