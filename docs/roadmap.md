@@ -215,9 +215,16 @@ Runtime policy should be the normal switch. It is reversible, auditable, and doe
 not risk a broken PAM stack. Uninstall is for cleaning the machine, not for daily
 toggling.
 
-The phone can hide or grey out an action the host marks disabled; that is only a
-UI hint. The host must enforce the same decision, and the phone must still refuse
-an unexpected request for a disabled action.
+A **phone-side mask** is the narrowest switch of all: no sudo, no PAM edit. It
+only means this phone will refuse requests for that action. The host may still
+invoke the PAM module; with `sufficient`, a refusal or unavailable daemon falls
+through to the password. A host per-user policy disable also needs no sudo for
+that user's own actions. Removing the line globally, changing another user's
+policy, or uninstalling the module/package needs root.
+
+The phone can hide or grey out an action it has masked; that is only a UI hint.
+The host must still enforce its own policy, and the phone must still refuse an
+unexpected request for a masked action.
 
 Recommendations for implementation:
 
