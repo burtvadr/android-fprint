@@ -20,10 +20,6 @@ signature over a fresh challenge instead of trusting a transmitted `YES`.
   <img src="media/icons/auto/android-fprint-light.svg" width="180" alt="Light icon" />
 </p>
 
-<p align="center">
-  <img src="media/icons/material/m3-roles-preview.svg" width="600" alt="Material 3 fingerprint icon roles" />
-</p>
-
 ```text
 $ phone-authctl authenticate --user alice --purpose sudo
 
