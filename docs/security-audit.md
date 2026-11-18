@@ -85,6 +85,7 @@ when the finding was first written.
 
 **Severity:** High  
 **Status:** Resolved  
+**Resolved in:** `d357f26`  
 **Source:** external review, 2026-11-18  
 **Aliases:** pairing MITM, key substitution, code-vs-key binding  
 **Affected:** `protocol/specification/PROTOCOL.md` §6.0/§6.4,
@@ -637,6 +638,7 @@ backup created by the same procedure.
 
 **Severity:** Medium  
 **Status:** Resolved  
+**Resolved in:** `d357f26`  
 **Source:** second source review, 2026-11-18  
 **Aliases:** IPC memory exhaustion, `read_line`, slowloris on the Unix socket  
 **Affected:** `linux/phone-authd/src/ipc.rs`, `linux/phone-authd/src/server.rs`
@@ -666,6 +668,7 @@ slot is dropped rather than queued.
 
 **Severity:** Low–Medium  
 **Status:** Resolved  
+**Resolved in:** `d357f26`  
 **Source:** second source review, 2026-11-18  
 **Aliases:** pending-slot exhaustion, authenticated local DoS  
 **Affected:** `linux/phone-authd/src/server.rs`, `linux/phone-authd/src/engine.rs`
@@ -690,6 +693,7 @@ response is rejected independently of the caller's timeout.
 
 **Severity:** Medium  
 **Status:** Resolved  
+**Resolved in:** `d357f26`  
 **Source:** second source review, 2026-11-18  
 **Aliases:** consent context, display name spoofing, omitted operation  
 **Affected:** `android/app/src/main/kotlin/com/androidfprint/session/AuthenticatorSession.kt`,
@@ -720,6 +724,7 @@ operation. The success screen repeats the stored name and key id.
 
 **Severity:** Medium  
 **Status:** Resolved in tree  
+**Resolved in:** `d357f26`  
 **Source:** second source review, 2026-11-18  
 **Aliases:** connection flood, TLS slowloris, stalled frames, wildcard bind  
 **Affected:** `linux/phone-authd/src/transport/wifi.rs`,
