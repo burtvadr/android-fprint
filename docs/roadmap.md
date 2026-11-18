@@ -137,12 +137,12 @@ of the `auth` stack:
 
 ```text
 /etc/pam.d/gdm-password
-  auth  sufficient  pam_phone_auth.so  purpose=gdm  timeout_ms=15000
+  auth  sufficient  pam_phone_auth.so  purpose=gdm  timeout_ms=5000
   auth  include     system-local-login
   ...
 
 /etc/pam.d/polkit-1
-  auth  sufficient  pam_phone_auth.so  purpose=polkit  timeout_ms=15000
+  auth  sufficient  pam_phone_auth.so  purpose=polkit  timeout_ms=5000
   auth  include     system-auth
   ...
 ```
@@ -198,7 +198,7 @@ Current behavior:
 
 - PAM calls the phone module first.
 - If the phone is paired and connected but not answered, the module waits up to
-  `timeout_ms` (15 s in the gdm line).
+  `timeout_ms` (5 s in the gdm line by default).
 - If the daemon has no connected device, it should return quickly and fall
   through to the password.
 - The line is `sufficient`, so a timeout/unavailable result must continue to
@@ -223,7 +223,8 @@ Required tests:
 
 Possible improvements, in order:
 
-1. Lower the lock-screen timeout to 8–10 s; keep it configurable.
+1. Keep the lock-screen timeout short (5 s by default) and configurable with
+   `--timeout`; test whether 5 s is long enough in practice.
 2. Add a fast pre-check so an unpaired/disconnected phone returns immediately.
 3. Emit a PAM info message asking the user to check the phone, if GDM displays it.
 4. Document the wait in the UI/README.

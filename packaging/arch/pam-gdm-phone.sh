@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Install or roll back the phone authenticator in the GNOME/gdm-password stack.
+# Install, update or roll back the phone authenticator in the GNOME/gdm-password
+# stack.
 #
 # This is intentionally scoped to gdm-password. It does not touch system-auth,
 # sshd, su or gdm-fingerprint. gdm-password is used by both the GDM password
@@ -11,17 +12,19 @@ set -euo pipefail
 VENDOR="/usr/lib/pam.d/gdm-password"
 TARGET="/etc/pam.d/gdm-password"
 RECORD="/etc/pam.d/.gdm-password.phone.rollback"
-LINE="auth        sufficient    pam_phone_auth.so purpose=gdm timeout_ms=15000"
+TIMEOUT_SECONDS=5
+LINE=""
 TMP_FILE=""
 
 usage() {
     cat <<EOF
-Usage: sudo $0 [--dry-run] [--rollback]
+Usage: sudo $0 [--dry-run] [--timeout SECONDS] [--rollback]
 
-  --dry-run    show the proposed change and exit
-  --rollback   restore the file saved by the last install
+  --dry-run           show the proposed change and exit
+  --timeout SECONDS   phone wait before the password fallback (default: 5)
+  --rollback          restore the file saved by the last install
 
-The change is a local /etc/pam.d/gdm-password override. It adds one
+The change is a local /etc/pam.d/gdm-password override. It adds or updates one
 sufficient line before the existing auth stack and preserves everything else.
 It does not modify /etc/pam.d/system-auth.
 EOF
@@ -54,21 +57,91 @@ rollback() {
     echo "GNOME will use the restored PAM stack on the next authentication."
 }
 
+validate_timeout() {
+    case "$TIMEOUT_SECONDS" in
+        ''|*[!0-9]*)
+            echo "--timeout must be a whole number of seconds" >&2
+            exit 2
+            ;;
+    esac
+    if [ "$TIMEOUT_SECONDS" -lt 1 ] || [ "$TIMEOUT_SECONDS" -gt 60 ]; then
+        echo "--timeout must be between 1 and 60 seconds" >&2
+        exit 2
+    fi
+    LINE="auth        sufficient    pam_phone_auth.so purpose=gdm timeout_ms=$((TIMEOUT_SECONDS * 1000))"
+}
+
 main() {
     local dry_run=0
-    case "${1:-}" in
-        "") ;;
-        --dry-run) dry_run=1 ;;
-        --rollback) rollback; return ;;
-        -h|--help) usage; return ;;
-        *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
-    esac
 
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --dry-run)
+                dry_run=1
+                ;;
+            --timeout)
+                if [ "$#" -lt 2 ]; then
+                    echo "--timeout needs a value" >&2
+                    usage >&2
+                    exit 2
+                fi
+                TIMEOUT_SECONDS="$2"
+                shift
+                ;;
+            --rollback)
+                rollback
+                return
+                ;;
+            -h|--help)
+                usage
+                return
+                ;;
+            *)
+                echo "unknown argument: $1" >&2
+                usage >&2
+                exit 2
+                ;;
+        esac
+        shift
+    done
+
+    validate_timeout
     require_root
 
+    TMP_FILE="$(mktemp)"
+    trap 'rm -f "${TMP_FILE:-}"' EXIT
+
+    # Already installed: update the existing phone line in place. This is how a
+    # 15 s timeout becomes 5 s without losing the rollback record.
     if [ -f "$TARGET" ] && grep -q 'pam_phone_auth\.so' "$TARGET"; then
-        echo "$TARGET already contains a phone-auth line; nothing to do."
-        exit 0
+        awk -v line="$LINE" '
+            /pam_phone_auth\.so/ { print line; next }
+            { print }
+        ' "$TARGET" > "$TMP_FILE"
+
+        if cmp -s "$TARGET" "$TMP_FILE"; then
+            echo "$TARGET already uses timeout_ms=$((TIMEOUT_SECONDS * 1000)); nothing to do."
+            exit 0
+        fi
+
+        echo "==> proposed change"
+        diff -u "$TARGET" "$TMP_FILE" || true
+
+        if [ "$dry_run" -eq 1 ]; then
+            echo
+            echo "Dry run only; no files changed."
+            exit 0
+        fi
+
+        local backup="$TARGET.bak.$(date +%Y%m%d-%H%M%S)"
+        cp -a "$TARGET" "$backup"
+        install -m 0644 -o root -g root "$TMP_FILE" "$TARGET"
+
+        echo
+        echo "Updated the phone line in $TARGET to timeout_ms=$((TIMEOUT_SECONDS * 1000))."
+        echo "Backup: $backup"
+        echo "Existing rollback record left unchanged: $RECORD"
+        return
     fi
 
     if [ ! -f "$VENDOR" ]; then
@@ -78,9 +151,6 @@ main() {
 
     local base="$VENDOR"
     [ -f "$TARGET" ] && base="$TARGET"
-
-    TMP_FILE="$(mktemp)"
-    trap 'rm -f "${TMP_FILE:-}"' EXIT
 
     if ! awk -v line="$LINE" '
         BEGIN { inserted = 0 }
@@ -118,7 +188,7 @@ main() {
     chmod 0600 "$RECORD"
 
     echo
-    echo "Installed the phone line in $TARGET."
+    echo "Installed the phone line in $TARGET with timeout_ms=$((TIMEOUT_SECONDS * 1000))."
     if [ "$backup" != "absent" ]; then
         echo "Backup: $backup"
     else
@@ -133,4 +203,4 @@ main() {
     echo "  4. If it fails, switch to a TTY and run: sudo $0 --rollback"
 }
 
-main "${1:-}"
+main "$@"
