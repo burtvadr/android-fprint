@@ -1,5 +1,5 @@
 {
-  "code": "000207",
+  "code": "473611",
   "description": "Pairing transcript. Both sides derive the same session secret from the two nonces; the MACs prove it.",
   "device_id": "33333333333333333333333333333333",
   "device_key": {

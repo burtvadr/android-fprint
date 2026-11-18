@@ -231,8 +231,8 @@ async fn run(mut args: Args) -> Result<()> {
     println!(
         "[phone] device {} key {} fingerprint {}",
         &device.device_id.to_hex()[..16],
-        &device.device_key_id_short(),
-        &device.public_key().short_fingerprint()
+        device.device_key_id_short(),
+        device.public_key().short_fingerprint()
     );
     if std::env::var("PHONE_SIM_PRINT_RECORD").is_ok() {
         println!(

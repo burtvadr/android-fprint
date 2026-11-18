@@ -60,6 +60,8 @@ object Domains {
     val SALT_PAIR = "ALP-PAIR-SALT-V1".toByteArray(Charsets.UTF_8)
     val DEVICE_CONFIRM = "ALP-DEVICE-CONFIRM-V1".toByteArray(Charsets.UTF_8)
     val HOST_CONFIRM = "ALP-HOST-CONFIRM-V1".toByteArray(Charsets.UTF_8)
+    /** Expansion domain used only if rejection sampling exhausts the first block. */
+    val PAIR_CODE = "ALP-PAIR-CODE-V1".toByteArray(Charsets.UTF_8)
 }
 
 /** Convenience for hex, which the CLI and the vector runner need. */
@@ -78,14 +80,25 @@ object Hex {
     }
 }
 
-/** A 16-byte opaque identifier: `host_id`, `device_id`, `request_id`, `session_id`. */
-@JvmInline
-value class Id(val bytes: ByteArray) {
+/**
+ * A 16-byte opaque identifier: `host_id`, `device_id`, `request_id`, `session_id`.
+ *
+ * A plain class rather than a value class because Kotlin's generated value-class
+ * equality would compare the underlying `ByteArray` by reference. Every identity
+ * check in this project is a byte comparison, so that would make two equal ids
+ * unequal and silently deny valid requests.
+ */
+class Id(val bytes: ByteArray) {
     init {
         require(bytes.size == Limits.ID_LEN) { "identifier must be ${Limits.ID_LEN} bytes" }
     }
 
     fun toHex(): String = Hex.encode(bytes)
+
+    override fun equals(other: Any?): Boolean =
+        this === other || (other is Id && bytes.contentEquals(other.bytes))
+
+    override fun hashCode(): Int = bytes.contentHashCode()
 
     override fun toString(): String = toHex()
 
@@ -101,9 +114,21 @@ value class Id(val bytes: ByteArray) {
 }
 
 /** A 32-byte single-use authentication challenge. */
-@JvmInline
-value class Challenge(val bytes: ByteArray) {
+class Challenge(val bytes: ByteArray) {
+    init {
+        require(bytes.size == Limits.CHALLENGE_LEN) {
+            "challenge must be ${Limits.CHALLENGE_LEN} bytes"
+        }
+    }
+
     fun toHex(): String = Hex.encode(bytes)
+
+    override fun equals(other: Any?): Boolean =
+        this === other || (other is Challenge && bytes.contentEquals(other.bytes))
+
+    override fun hashCode(): Int = bytes.contentHashCode()
+
+    override fun toString(): String = toHex()
 
     companion object {
         fun random(): Challenge {
@@ -246,7 +271,7 @@ data class AuthRequest(
 private fun checkName(field: String, value: String) {
     require(value.isNotEmpty()) { "$field must not be empty" }
     require(value.length <= Limits.MAX_NAME_LEN) { "$field exceeds ${Limits.MAX_NAME_LEN} characters" }
-    require(!value.contains(' ')) { "$field contains NUL" }
+    require(!value.contains('\u0000')) { "$field contains NUL" }
 }
 
 data class SessionHello(
@@ -431,6 +456,26 @@ data class ErrorMessage(val code: Int, val message: String, val requestId: Id? =
 // Pairing
 // ---------------------------------------------------------------------------
 
+enum class CodeEntry(val wire: String) {
+    /** The Linux host displays the code; the phone types it. */
+    DEVICE("device"),
+
+    /** The phone displays the code; the Linux host types it. */
+    HOST("host"),
+    ;
+
+    companion object {
+        fun fromWire(value: String): CodeEntry = when (value) {
+            "device" -> DEVICE
+            "host" -> HOST
+            else -> throw ProtocolException(
+                ErrorCode.BAD_REQUEST,
+                "unknown code_entry \"$value\"; expected device or host",
+            )
+        }
+    }
+}
+
 data class PairingStart(
     val sessionId: Id,
     val hostId: Id,
@@ -438,12 +483,15 @@ data class PairingStart(
     val hostKeyId: String,
     /** Operator-chosen code, or empty when the host chose none. */
     val code: String,
+    /** Which endpoint must type the derived code. */
+    val codeEntry: CodeEntry = CodeEntry.DEVICE,
     val expiresAt: Long,
     val hostNonce: ByteArray,
 ) {
     fun toPayload(): ByteArray = Cbor.encode(
         Cbor.ofMap(
             "code" to Cbor.text(code),
+            "code_entry" to Cbor.text(codeEntry.wire),
             "expires_at" to Cbor.uint(expiresAt),
             "host_id" to Cbor.bytes(hostId.bytes),
             "host_key_id" to Cbor.text(hostKeyId),
@@ -464,6 +512,11 @@ data class PairingStart(
             ) {
                 throw ProtocolException(ErrorCode.BAD_REQUEST, "code must be empty or six ASCII digits")
             }
+            val codeEntry = when (val entry = v["code_entry"]) {
+                null -> CodeEntry.DEVICE
+                is Cbor.Value.Text -> CodeEntry.fromWire(entry.value)
+                else -> throw ProtocolException(ErrorCode.BAD_REQUEST, "code_entry must be text")
+            }
             val nonce = (v["host_nonce"] as? Cbor.Value.Bytes)?.value
                 ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "missing host_nonce")
             if (nonce.size != Limits.CHALLENGE_LEN) {
@@ -475,6 +528,7 @@ data class PairingStart(
                 hostPublicKey = (v["host_pubkey"] as Cbor.Value.Bytes).value,
                 hostKeyId = (v["host_key_id"] as Cbor.Value.Text).value,
                 code = code,
+                codeEntry = codeEntry,
                 expiresAt = (v["expires_at"] as Cbor.Value.Uint).value,
                 hostNonce = nonce,
             )
@@ -490,9 +544,11 @@ data class PairingSubmit(
     val deviceKeyId: String,
     val deviceNonce: ByteArray,
     val mac: ByteArray,
+    /** Revocation tokens for older pairings this phone asks the host to clean up. */
+    val cleanupTokens: List<ByteArray> = emptyList(),
 ) {
-    fun toPayload(): ByteArray = Cbor.encode(
-        Cbor.ofMap(
+    fun toPayload(): ByteArray {
+        val entries = mutableListOf(
             "device_id" to Cbor.bytes(deviceId.bytes),
             "device_key_id" to Cbor.text(deviceKeyId),
             "device_name" to Cbor.text(deviceName),
@@ -501,7 +557,11 @@ data class PairingSubmit(
             "mac" to Cbor.bytes(mac),
             "session_id" to Cbor.bytes(sessionId.bytes),
         )
-    )
+        if (cleanupTokens.isNotEmpty()) {
+            entries += "cleanup_tokens" to Cbor.array(cleanupTokens.map { Cbor.bytes(it) })
+        }
+        return Cbor.encode(Cbor.ofMap(*entries.toTypedArray()))
+    }
 
     companion object {
         fun fromPayload(payload: ByteArray): PairingSubmit {
@@ -515,6 +575,27 @@ data class PairingSubmit(
             if (nonce.size != Limits.CHALLENGE_LEN) {
                 throw ProtocolException(ErrorCode.BAD_REQUEST, "device_nonce must be 32 bytes")
             }
+            val cleanupTokens = when (val raw = v["cleanup_tokens"]) {
+                null -> emptyList()
+                is Cbor.Value.Arr -> raw.items.map { entry ->
+                    val bytes = (entry as? Cbor.Value.Bytes)?.value
+                        ?: throw ProtocolException(
+                            ErrorCode.BAD_REQUEST,
+                            "cleanup_tokens entries must be byte strings",
+                        )
+                    if (bytes.size != 32) {
+                        throw ProtocolException(
+                            ErrorCode.BAD_REQUEST,
+                            "cleanup_tokens entries must be 32 bytes",
+                        )
+                    }
+                    bytes
+                }
+                else -> throw ProtocolException(
+                    ErrorCode.BAD_REQUEST,
+                    "cleanup_tokens must be an array",
+                )
+            }
             return PairingSubmit(
                 sessionId = Id((v["session_id"] as Cbor.Value.Bytes).value),
                 deviceId = Id((v["device_id"] as Cbor.Value.Bytes).value),
@@ -523,18 +604,26 @@ data class PairingSubmit(
                 deviceKeyId = (v["device_key_id"] as Cbor.Value.Text).value,
                 deviceNonce = nonce,
                 mac = mac,
+                cleanupTokens = cleanupTokens,
             )
         }
     }
 }
 
-data class PairingResult(val sessionId: Id, val status: Long, val hostMac: ByteArray?) {
+data class PairingResult(
+    val sessionId: Id,
+    val status: Long,
+    val hostMac: ByteArray?,
+    /** Bearer capability for revoking this pairing later. */
+    val revocationToken: ByteArray? = null,
+) {
     fun toPayload(): ByteArray {
         val entries = mutableListOf(
             "session_id" to Cbor.bytes(sessionId.bytes),
             "status" to Cbor.uint(status),
         )
         hostMac?.let { entries += "host_mac" to Cbor.bytes(it) }
+        revocationToken?.let { entries += "revocation_token" to Cbor.bytes(it) }
         return Cbor.encode(Cbor.ofMap(*entries.toTypedArray()))
     }
 
@@ -549,11 +638,44 @@ data class PairingResult(val sessionId: Id, val status: Long, val hostMac: ByteA
             if (status == 0L && hostMac == null) {
                 throw ProtocolException(ErrorCode.BAD_REQUEST, "a success must carry host_mac")
             }
+            val revocationToken = (v["revocation_token"] as? Cbor.Value.Bytes)?.value
+            if (revocationToken != null && revocationToken.size != 32) {
+                throw ProtocolException(
+                    ErrorCode.BAD_REQUEST,
+                    "revocation_token must be 32 bytes",
+                )
+            }
             return PairingResult(
                 sessionId = Id((v["session_id"] as Cbor.Value.Bytes).value),
                 status = status,
                 hostMac = hostMac,
+                revocationToken = revocationToken,
             )
+        }
+    }
+}
+
+/**
+ * A device-initiated request to revoke its own pairing.
+ *
+ * The token is a bearer capability issued at pairing; it authorizes revocation
+ * only. The host looks the token up by hash and marks the matching record revoked.
+ */
+data class Unpair(val token: ByteArray) {
+    fun toPayload(): ByteArray = Cbor.encode(
+        Cbor.ofMap("token" to Cbor.bytes(token)),
+    )
+
+    companion object {
+        fun fromPayload(payload: ByteArray): Unpair {
+            val v = Cbor.decode(payload) as? Cbor.Value.Map
+                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "unpair is not a map")
+            val token = (v["token"] as? Cbor.Value.Bytes)?.value
+                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "missing token")
+            if (token.size != 32) {
+                throw ProtocolException(ErrorCode.BAD_REQUEST, "revocation token must be 32 bytes")
+            }
+            return Unpair(token)
         }
     }
 }
@@ -585,11 +707,41 @@ class PairingSession(val sessionId: Id, val hostNonce: ByteArray) {
         return hmac(s, Domains.PAIR + byteArrayOf(0x00) + sessionId.bytes)
     }
 
-    /** The code both screens show. */
+    /**
+     * The six-digit code the operator types on the other endpoint.
+     *
+     * Rejection sampling, not a modulo reduction. `4_294_000_000` is the largest
+     * multiple of `1_000_000` below `2^32`, so rejecting words at or above it
+     * leaves every code 000000..999999 with exactly 4,294 chances. The expansion
+     * is only reached with probability about 6e-30.
+     */
     fun code(): String {
-        val p = confirmationKey()
-        val v = (p[0].toInt() and 0xFF) % 1_000_000
+        val v = codeFromMaterial(confirmationKey())
         return v.toString().padStart(Limits.PAIRING_CODE_DIGITS, '0')
+    }
+
+    private fun codeFromMaterial(p: ByteArray): Long {
+        val limit = 4_294_000_000L
+        var block = p
+        var counter = 0L
+        while (true) {
+            var i = 0
+            while (i + 4 <= block.size) {
+                val v = ((block[i].toLong() and 0xFF) shl 24) or
+                    ((block[i + 1].toLong() and 0xFF) shl 16) or
+                    ((block[i + 2].toLong() and 0xFF) shl 8) or
+                    (block[i + 3].toLong() and 0xFF)
+                if (v < limit) return v % 1_000_000L
+                i += 4
+            }
+            counter += 1
+            val msg = Domains.PAIR_CODE + byteArrayOf(0) + counter.toBigEndianBytes()
+            block = hmac(p, msg)
+        }
+    }
+
+    private fun Long.toBigEndianBytes(): ByteArray = ByteArray(8) { i ->
+        (this ushr (56 - 8 * i)).toByte()
     }
 
     private fun transcript(hostId: Id, deviceId: Id, hostPub: ByteArray, devicePub: ByteArray): ByteArray =
@@ -618,6 +770,7 @@ object MessageType {
     const val AUTH_REQUEST = 12
     const val AUTH_RESPONSE = 13
     const val AUTH_REJECT = 14
+    const val UNPAIR = 15
     const val ERROR = 20
 }
 
@@ -666,6 +819,11 @@ sealed class Message {
         override fun toPayload() = v.toPayload()
     }
 
+    data class UnpairMessage(val v: Unpair) : Message() {
+        override val type = MessageType.UNPAIR
+        override fun toPayload() = v.toPayload()
+    }
+
     data class ErrorMessageEnvelope(val v: ErrorMessage) : Message() {
         override val type = MessageType.ERROR
         override fun toPayload() = v.toPayload()
@@ -688,6 +846,7 @@ sealed class Message {
                 MessageType.AUTH_REQUEST -> AuthRequestMessage(AuthRequest.fromPayload(frame.payload))
                 MessageType.AUTH_RESPONSE -> AuthResponseMessage(AuthResponse.fromPayload(frame.payload))
                 MessageType.AUTH_REJECT -> AuthRejectMessage(AuthReject.fromPayload(frame.payload))
+                MessageType.UNPAIR -> UnpairMessage(Unpair.fromPayload(frame.payload))
                 MessageType.ERROR -> ErrorMessageEnvelope(ErrorMessage.fromPayload(frame.payload))
                 else -> throw ProtocolException(ErrorCode.UNKNOWN_MESSAGE, "unknown message type ${frame.msgType}")
             }

@@ -103,11 +103,20 @@ fun authenticateStrong(
     title: String,
     subtitle: String,
     description: String,
+    /**
+     * The prepared signature Keystore must authorise for this prompt.
+     *
+     * Required: the device key demands authentication for every signature, and
+     * Keystore authorises exactly the `Signature` object bound to the prompt, not
+     * the app process. A prompt without this object could never produce a usable
+     * signature.
+     */
+    cryptoObject: BiometricPrompt.CryptoObject,
     onResult: (BiometricOutcome) -> Unit,
-) {
+): BiometricPrompt? {
     if (availability !is BiometricAvailability.Available) {
         onResult(BiometricOutcome.Unavailable(availability))
-        return
+        return null
     }
     val prompt = BiometricPrompt(
         activity,
@@ -131,7 +140,9 @@ fun authenticateStrong(
     )
     prompt.authenticate(
         BiometricGatekeeper(activity).promptInfo(title, subtitle, description),
+        cryptoObject,
     )
+    return prompt
 }
 
 /** The outcome of one biometric interaction. Only [Succeeded] permits signing. */

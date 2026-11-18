@@ -483,6 +483,7 @@ fn main() {
                     host_pubkey: host_sk.public_key(),
                     host_key_id: host_sk.public_key().key_id_hex(),
                     code: "".into(),
+                    code_entry: android_fprint_protocol::pairing::CodeEntry::Device,
                     // PairingStart::from_payload checks the window against the
                     // current clock, so this vector is checked as raw CBOR only.
                     expires_at: 1_700_000_120,
@@ -503,6 +504,7 @@ fn main() {
                     device_key_id: device_pk.key_id_hex(),
                     device_nonce: [0x99; 32],
                     mac: [0u8; 32],
+                    cleanup_tokens: Vec::new(),
                 })
                 .to_payload()
             ),
@@ -515,6 +517,7 @@ fn main() {
                     session_id: det_id(0x99),
                     status: 0,
                     host_mac: Some([0u8; 32]),
+                    revocation_token: Some([0xAA; 32]),
                 })
                 .to_payload()
             ),

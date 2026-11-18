@@ -8,6 +8,7 @@ import com.androidfprint.keystore.DeviceAuthKey
 import com.androidfprint.protocol.AuthRequest
 import com.androidfprint.protocol.AuthResponse
 import com.androidfprint.protocol.Challenge
+import com.androidfprint.protocol.CodeEntry
 import com.androidfprint.protocol.ErrorCode
 import com.androidfprint.protocol.Frame
 import com.androidfprint.protocol.Hex
@@ -21,11 +22,14 @@ import com.androidfprint.protocol.PairingSubmit
 import com.androidfprint.protocol.ProtocolException
 import com.androidfprint.protocol.SessionHello
 import com.androidfprint.protocol.SessionHelloAck
+import com.androidfprint.protocol.Unpair
 import com.androidfprint.protocol.sha256
 import com.androidfprint.transport.BleTransport
 import com.androidfprint.transport.WifiTransport
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -51,9 +55,33 @@ import java.util.concurrent.Executor
 sealed interface SessionState {
     data object Idle : SessionState
 
-    data class PairingAwaitingCode(val code: String, val hostName: String) : SessionState
+    /**
+     * `code_entry = device`: the host displays the code and the phone will ask
+     * the operator to type it after the host's MAC verifies.
+     *
+     * The derived code is deliberately absent: the phone must never display it.
+     */
+    data class PairingAwaitingCode(val hostName: String) : SessionState
 
-    data class PairingConfirmed(val code: String) : SessionState
+    /**
+     * `code_entry = host`: the phone displays the code and the operator types it
+     * into the Linux terminal.
+     */
+    data class PairingAwaitingHostCode(val hostName: String, val code: String) : SessionState
+
+    /**
+     * `code_entry = device`: the host proved the transcript and now the operator
+     * must type the code shown on the Linux screen. A bare tap is not enough.
+     */
+    data class PairingAwaitingConfirmation(val hostName: String) : SessionState
+
+    /**
+     * `code_entry = host`: the host proved the transcript after typing the code
+     * from this screen. The operator still has to approve this host explicitly.
+     */
+    data class PairingAwaitingApproval(val hostName: String, val code: String) : SessionState
+
+    data class PairingConfirmed(val hostName: String) : SessionState
 
     /** A request is on screen, waiting for the operator. */
     data class AwaitingApproval(val request: AuthRequest) : SessionState
@@ -80,16 +108,62 @@ sealed interface SessionState {
 class AuthenticatorSession(
     private val context: Context,
     private val key: DeviceAuthKey,
-    private val deviceId: Id,
-    private val deviceName: String,
+    val deviceId: Id,
+    val deviceName: String,
     /** Paired hosts, persisted. A phone pairs with more than one PC. */
     private val hosts: HostStore,
     /** Scope for background work; supplied by the activity's lifecycle. */
     @Suppress("unused") private val scope: CoroutineScope,
 ) {
 
+    private val pendingRevocations = PendingRevocations(context)
+
+    /** Pairing state that must survive between `PAIRING_START` and `PAIRING_RESULT`. */
+    private data class PendingPairing(
+        val session: PairingSession,
+        val hostId: Id,
+        val hostPublicKey: ByteArray,
+        val hostName: String,
+        val code: String,
+        val codeEntry: CodeEntry,
+    )
+
+    private var pendingPairing: PendingPairing? = null
+
+    /**
+     * A pairing whose reciprocal MAC has verified, waiting for the operator to
+     * finish the human gate on this screen.
+     *
+     * Deliberately not written to [HostStore] yet. The MAC proves the host derived
+     * the same transcript; the operator action proves a human read the code.
+     * Device-entry mode requires typing the host's code. Host-entry mode requires
+     * an explicit Allow after the host typed this screen's code.
+     */
+    private data class ConfirmedPairing(
+        val host: KnownHost,
+        val code: String,
+        val hostName: String,
+        val codeEntry: CodeEntry,
+    )
+
+    private var pendingConfirmation: ConfirmedPairing? = null
+
+    /** Clears a parked confirmation that the operator never settles. */
+    private var confirmationTimeout: Job? = null
+
+    /**
+     * Invoked when the operator settles pairing (confirms or rejects), so the
+     * transport reconnects pinned or drops the rejected link.
+     */
+    @Volatile
+    private var pairingSettledListener: (() -> Unit)? = null
+
     private val _state = MutableStateFlow<SessionState>(SessionState.Idle)
     val state: StateFlow<SessionState> = _state
+
+    /** Paired hosts, observable so the overview updates after an unpair. */
+    private val _hosts = MutableStateFlow<List<KnownHost>>(hosts.all())
+    val knownHostsFlow: StateFlow<List<KnownHost>> = _hosts
 
     /**
      * Hosts this device has paired with, read through to [HostStore].
@@ -118,6 +192,16 @@ class AuthenticatorSession(
      */
     private var approvedRequestId: String? = null
 
+    /**
+     * The signature prepared for the request whose biometric prompt is up.
+     *
+     * Keystore authorises the exact `Signature` object bound to the prompt, so this
+     * is the only path from a successful biometric to an approval. It is cleared on
+     * every denial, link loss or stale callback so a late result cannot sign a
+     * request the operator no longer has on screen.
+     */
+    private var signingOperation: DeviceAuthKey.SigningOperation? = null
+
     /** Whether this device can satisfy the strong-biometric policy at all. */
     @Volatile
     private var strongBiometricAvailable: Boolean = false
@@ -134,12 +218,52 @@ class AuthenticatorSession(
      */
     fun addKnownHost(host: KnownHost) {
         hosts.put(host)
+        _hosts.value = hosts.all()
     }
 
-    fun knownHosts(): List<KnownHost> = hosts.all()
+    fun knownHosts(): List<KnownHost> = _hosts.value
 
-    /** Forgets one host. Returns whether it was actually paired. */
-    fun forgetHost(hostId: com.androidfprint.protocol.Id): Boolean = hosts.remove(hostId)
+    /** Updates only the operator-visible label; never the key or pin. */
+    fun updateHostName(hostId: com.androidfprint.protocol.Id, name: String) {
+        val host = hosts.get(hostId) ?: return
+        if (name.isBlank() || host.hostName == name) return
+        hosts.put(host.copy(hostName = name))
+        _hosts.value = hosts.all()
+    }
+
+    /**
+     * Installs the callback that runs once the operator settles a pairing.
+     *
+     * The transport uses it to drop the unpinned bootstrap connection and reconnect
+     * with the new pin (or close the link after a rejection). An authentication
+     * request must never be answerable on the unpinned link that happened to carry
+     * the pairing exchange.
+     */
+    fun setPairingSettledListener(listener: (() -> Unit)?) {
+        pairingSettledListener = listener
+    }
+
+    /**
+     * Forgets one host. Returns whether it was actually paired.
+     *
+     * The phone's local record goes first. If a pinned link is open, it also sends
+     * the host the bearer token so the host can revoke its side. If the host is
+     * unreachable, the token is kept for the next pairing submit.
+     */
+    fun forgetHost(hostId: com.androidfprint.protocol.Id): Boolean {
+        val host = hosts.get(hostId) ?: return false
+        host.revocationToken?.let { token ->
+            pendingRevocations.add(hostId, token)
+            if (transportSink != null) {
+                send(Message.UnpairMessage(Unpair(token)).toFrame())
+            }
+        }
+        val removed = hosts.remove(hostId)
+        if (removed) {
+            _hosts.value = hosts.all()
+        }
+        return removed
+    }
 
     /** Records whether a strong biometric is enrolled, for policy decisions. */
     fun setAvailability(available: Boolean) {
@@ -156,6 +280,7 @@ class AuthenticatorSession(
         pendingRequest?.let { reject(it) }
         pendingRequest = null
         approvedRequestId = null
+        signingOperation = null
     }
 
     /**
@@ -166,6 +291,51 @@ class AuthenticatorSession(
      * troubling the operator.
      */
     fun offerRequest(request: AuthRequest) {
+        val now = System.currentTimeMillis() / 1000
+        // Unpairing must take effect on an already-open pinned link too. The link
+        // was authenticated when it opened; the host record can disappear later.
+        if (hosts.get(request.hostId) == null) {
+            send(
+                Message.AuthRejectMessage(
+                    com.androidfprint.protocol.AuthReject(
+                        request.requestId,
+                        ErrorCode.NOT_PAIRED.code,
+                    ),
+                ).toFrame(),
+            )
+            _state.value = SessionState.Failed("request from an unpaired host")
+            return
+        }
+        // One decision at a time. A second request must not replace the one whose
+        // signature is already bound to a visible prompt.
+        if (pendingRequest != null || signingOperation != null) {
+            send(
+                Message.AuthRejectMessage(
+                    com.androidfprint.protocol.AuthReject(
+                        request.requestId,
+                        ErrorCode.RATE_LIMITED.code,
+                    ),
+                ).toFrame(),
+            )
+            return
+        }
+        if (request.expiresAt < now) {
+            // The host has already stopped waiting. Showing a prompt would train the
+            // operator to approve requests that cannot succeed.
+            send(
+                Message.AuthRejectMessage(
+                    com.androidfprint.protocol.AuthReject(
+                        request.requestId,
+                        ErrorCode.EXPIRED.code,
+                    ),
+                ).toFrame(),
+            )
+            _state.value = SessionState.Denied(
+                request.requestId.toHex(),
+                "this request has already expired",
+            )
+            return
+        }
         if (!strongBiometricAvailable) {
             // Refuse up front: a prompt that cannot succeed is just a way to train
             // the operator to tap through dialogs.
@@ -186,13 +356,76 @@ class AuthenticatorSession(
         requestApproval(request)
     }
 
-    /** Prepares the session to receive messages over whichever transport connects. */
-    fun connect() {
-        sender = { frame -> transportSink?.invoke(frame) }
+    /**
+     * Answers the host's `SESSION_HELLO`.
+     *
+     * The device nonce is fresh for every connection and is only used for this
+     * session; it never becomes long-lived state.
+     */
+    fun buildHelloAck(hello: SessionHello): SessionHelloAck {
+        val publicKey = key.publicKeyBytes()
+            ?: throw ProtocolException(ErrorCode.INTERNAL, "device key is unavailable")
+        val nonce = ByteArray(Limits.CHALLENGE_LEN).also {
+            java.security.SecureRandom().nextBytes(it)
+        }
+        return SessionHelloAck(
+            deviceId = deviceId,
+            deviceKeyId = Hex.encode(sha256(publicKey)),
+            deviceNonce = nonce,
+            sessionId = hello.sessionId,
+        )
+    }
+
+    /** Installs the sink for the currently connected transport. */
+    fun attachTransport(sink: (Frame) -> Unit) {
+        transportSink = sink
+    }
+
+    fun detachTransport() {
+        transportSink = null
+    }
+
+    /**
+     * Called by the transport when the link goes away.
+     *
+     * An unanswered request is a denial: the host has already stopped waiting, and
+     * nothing may be left on screen that could later be approved against a dead
+     * session.
+     */
+    fun transportLost(reason: String) {
+        transportSink = null
+        val pairing = pendingPairing
+        pendingPairing = null
+        val request = pendingRequest
+        pendingRequest = null
+        approvedRequestId = null
+        signingOperation = null
+        // A confirmation belongs to the connection that produced it. If that
+        // connection is gone, the host may already consider itself paired while
+        // this phone has not stored the pin; keeping the pending record would let
+        // a later tap trust a link nobody can reason about any more.
+        val awaitingConfirmation =
+            pendingConfirmation != null &&
+                (_state.value is SessionState.PairingAwaitingConfirmation ||
+                    _state.value is SessionState.PairingAwaitingApproval)
+        pendingConfirmation = null
+        confirmationTimeout?.cancel()
+        confirmationTimeout = null
+        when {
+            request != null ->
+                _state.value = SessionState.Denied(request.requestId.toHex(), reason)
+
+            pairing != null && (_state.value is SessionState.PairingAwaitingCode ||
+                _state.value is SessionState.PairingAwaitingHostCode) ->
+                _state.value = SessionState.Failed(reason)
+
+            awaitingConfirmation ->
+                _state.value = SessionState.Failed(reason)
+        }
     }
 
     /** Installed by the active transport adapter. */
-    var transportSink: ((Frame) -> Unit)? = null
+    private var transportSink: ((Frame) -> Unit)? = null
 
     // -----------------------------------------------------------------------
     // Pairing
@@ -202,14 +435,37 @@ class AuthenticatorSession(
      * Completes the device half of pairing.
      *
      * The code is derived from both nonces, so it can only be computed here, after
-     * the host's nonce has arrived. The operator compares the two screens; nothing
-     * is persisted until the reciprocal MAC verifies.
+     * the host's nonce has arrived. The selected `code_entry` mode decides which
+     * endpoint displays it; nothing is persisted until the reciprocal MAC verifies
+     * and the human gate is satisfied.
+     *
+     * @param hostName the operator-visible host label, when discovery supplied one.
      */
-    fun handlePairingStart(start: PairingStart): SessionState {
+    fun handlePairingStart(start: PairingStart, hostName: String): SessionState {
         return try {
+            if (pendingConfirmation != null) {
+                // Refuse the newcomer without disturbing the confirmation already on
+                // screen; fail() would replace the operator's pending decision.
+                return _state.value
+            }
+            val now = System.currentTimeMillis() / 1000
+            if (start.expiresAt < now) {
+                return fail("the pairing session has expired; start pairing again")
+            }
             if (start.hostPublicKey.size != Limits.PUBKEY_LEN) {
                 return fail("host public key is malformed")
             }
+            if (Hex.encode(sha256(start.hostPublicKey)) != start.hostKeyId) {
+                return fail("the host key identifier does not match its public key")
+            }
+            // A host identity is permanent. Re-pairing the same id with a different
+            // key must be refused rather than silently replacing the record.
+            hosts.get(start.hostId)?.let { existing ->
+                if (!existing.publicKeyBytes.contentEquals(start.hostPublicKey)) {
+                    return fail("this host is already paired with a different key")
+                }
+            }
+
             val deviceNonce = ByteArray(Limits.CHALLENGE_LEN).also {
                 java.security.SecureRandom().nextBytes(it)
             }
@@ -220,10 +476,8 @@ class AuthenticatorSession(
             // When the operator pre-selected a code, both sides must derive the same
             // value; a mismatch means the comparison they intended cannot succeed.
             if (start.code.isNotEmpty() && start.code != code) {
-                return fail("the code shown on the phone does not match the chosen code")
+                return fail("the code derived by this phone does not match the chosen code")
             }
-
-            _state.value = SessionState.PairingAwaitingCode(code, deviceName)
 
             val publicKeyBytes = key.publicKeyBytes()
                 ?: return fail("the device key is unavailable; re-enrolment may have invalidated it")
@@ -240,46 +494,173 @@ class AuthenticatorSession(
                 deviceKeyId = devicePublicKeyId,
                 deviceNonce = deviceNonce,
                 mac = mac,
+                cleanupTokens = pendingRevocations.tokens(start.hostId),
             )
+
+            val hostLabel = hostName.ifBlank { "Linux host" }
+            pendingPairing = PendingPairing(
+                session = session,
+                hostId = start.hostId,
+                hostPublicKey = start.hostPublicKey,
+                hostName = hostLabel,
+                code = code,
+                codeEntry = start.codeEntry,
+            )
+            val state = when (start.codeEntry) {
+                CodeEntry.DEVICE -> SessionState.PairingAwaitingCode(hostLabel)
+                CodeEntry.HOST -> SessionState.PairingAwaitingHostCode(hostLabel, code)
+            }
+            _state.value = state
             send(Message.PairingSubmitMessage(submit).toFrame())
-            SessionState.PairingAwaitingCode(code, deviceName)
+            state
         } catch (e: Exception) {
+            pendingPairing = null
             fail(e.message ?: "pairing failed")
         }
     }
 
-    /** Verifies the host's reciprocal MAC, which completes pairing. */
+    /**
+     * Verifies the host's reciprocal MAC.
+     *
+     * Verification does **not** persist anything. Device-entry mode then requires
+     * the operator to type the code shown on the Linux host; host-entry mode shows
+     * this phone's code and still requires an explicit Allow.
+     */
     fun handlePairingResult(
         result: PairingResult,
-        session: PairingSession,
-        hostPublicKey: ByteArray,
-        hostId: Id,
         pinnedCertificate: X509Certificate?,
     ): SessionState {
+        val pairing = pendingPairing ?: return fail("no pairing is in progress")
+        // One result per attempt: even a malformed or rejected result consumes the
+        // context, so it cannot be retried against a later session.
+        pendingPairing = null
         return try {
-            if (result.status != 0L) return fail("the host rejected the pairing")
+            if (result.sessionId != pairing.session.sessionId) {
+                return fail("the pairing result is for a different session")
+            }
+            if (result.status != 0L) {
+                return fail("the host rejected the pairing")
+            }
             val hostMac = result.hostMac ?: return fail("the host did not confirm pairing")
             val devicePublicKey = key.publicKeyBytes() ?: return fail("device key unavailable")
-            val expected = session.hostMac(hostId, deviceId, hostPublicKey, devicePublicKey)
+            val expected = pairing.session.hostMac(
+                pairing.hostId, deviceId, pairing.hostPublicKey, devicePublicKey,
+            )
             if (!com.androidfprint.protocol.constantTimeEquals(hostMac, expected)) {
                 // The host did not prove it derived the same secret, so the code the
                 // operator compared did not authenticate this exchange.
                 return fail("pairing confirmation failed")
             }
-            addKnownHost(
-                KnownHost(
-                    hostId = hostId,
-                    keyId = Hex.encode(sha256(hostPublicKey)),
-                    publicKeyBytes = hostPublicKey,
+            hosts.get(pairing.hostId)?.let { existing ->
+                if (!existing.publicKeyBytes.contentEquals(pairing.hostPublicKey)) {
+                    return fail("this host is already paired with a different key")
+                }
+            }
+            // The host has processed any cleanup tokens carried by this pairing
+            // submit before it committed the new record.
+            pendingRevocations.clear(pairing.hostId)
+            val pending = ConfirmedPairing(
+                host = KnownHost(
+                    hostId = pairing.hostId,
+                    keyId = Hex.encode(sha256(pairing.hostPublicKey)),
+                    publicKeyBytes = pairing.hostPublicKey,
                     pinnedCertificate = pinnedCertificate,
-                    hostName = deviceName,
+                    hostName = pairing.hostName,
+                    revocationToken = result.revocationToken,
                 ),
+                code = pairing.code,
+                hostName = pairing.hostName,
+                codeEntry = pairing.codeEntry,
             )
-            _state.value = SessionState.PairingConfirmed("")
-            SessionState.PairingConfirmed("")
+            pendingConfirmation = pending
+            confirmationTimeout?.cancel()
+            confirmationTimeout = scope.launch {
+                delay(PAIRING_CONFIRMATION_TIMEOUT_MS)
+                if (pendingConfirmation === pending) {
+                    pendingConfirmation = null
+                    fail("pairing confirmation timed out")
+                }
+            }
+            val state = when (pairing.codeEntry) {
+                CodeEntry.DEVICE -> SessionState.PairingAwaitingConfirmation(pairing.hostName)
+                CodeEntry.HOST -> SessionState.PairingAwaitingApproval(
+                    pairing.hostName,
+                    pairing.code,
+                )
+            }
+            _state.value = state
+            state
         } catch (e: Exception) {
             fail(e.message ?: "pairing verification failed")
         }
+    }
+
+    /**
+     * Settles the human gate and persists the host.
+     *
+     * [enteredCode] is required in [CodeEntry.DEVICE] mode and must match the
+     * code shown on the Linux host. In [CodeEntry.HOST] mode the host already
+     * typed this phone's code, so the phone's explicit approval is the remaining
+     * gate and [enteredCode] is ignored.
+     *
+     * This is the only place a pairing becomes persistent.
+     */
+    fun confirmPairing(enteredCode: String? = null): Boolean {
+        val pending = pendingConfirmation ?: run {
+            fail("no pairing is awaiting confirmation")
+            return false
+        }
+        if (pending.codeEntry == CodeEntry.DEVICE) {
+            val normalized = enteredCode.orEmpty().filter { it.isDigit() }
+            if (normalized.length != pending.code.length ||
+                !com.androidfprint.protocol.constantTimeEquals(
+                    normalized.toByteArray(Charsets.US_ASCII),
+                    pending.code.toByteArray(Charsets.US_ASCII),
+                )
+            ) {
+                return false
+            }
+        }
+        pendingConfirmation = null
+        confirmationTimeout?.cancel()
+        confirmationTimeout = null
+        addKnownHost(pending.host)
+        val state = SessionState.PairingConfirmed(pending.hostName)
+        _state.value = state
+        // Drop the unpinned bootstrap connection so the next one is TLS-pinned.
+        pairingSettledListener?.invoke()
+        return true
+    }
+
+    /** The operator rejected the pairing, or closed the confirmation. */
+    fun rejectPairing(): SessionState {
+        pendingConfirmation = null
+        pendingPairing = null
+        confirmationTimeout?.cancel()
+        confirmationTimeout = null
+        // Close the pairing link; the host may have persisted its side, but this
+        // phone is not going to trust it.
+        pairingSettledListener?.invoke()
+        return fail("pairing was not confirmed")
+    }
+
+    /**
+     * Clears a terminal result after the operator has read it.
+     *
+     * Manual launches have no auto-close timer. Pairing completion and the
+     * approved/denied/failed results are informational; returning to idle keeps
+     * the paired hosts and the background link intact.
+     */
+    fun dismissResult(): SessionState {
+        val current = _state.value
+        if (current is SessionState.PairingConfirmed ||
+            current is SessionState.Approved ||
+            current is SessionState.Denied ||
+            current is SessionState.Failed
+        ) {
+            _state.value = SessionState.Idle
+        }
+        return _state.value
     }
 
     // -----------------------------------------------------------------------
@@ -317,8 +698,11 @@ class AuthenticatorSession(
         }
 
         // Rate limiting on the device side, so a malicious host cannot spam the
-        // operator with prompts.
-        if (requestPromptCount >= MAX_PROMPTS_PER_WINDOW) {
+        // operator with prompts. This is a sliding window: five prompts in any
+        // sixty seconds, after which the operator gets a minute of quiet.
+        val nowMillis = System.currentTimeMillis()
+        promptTimes.removeAll { nowMillis - it >= PROMPT_WINDOW_MS }
+        if (promptTimes.size >= MAX_PROMPTS_PER_WINDOW) {
             _state.value = SessionState.Denied(
                 request.requestId.toHex(),
                 "too many requests; try again later",
@@ -333,7 +717,7 @@ class AuthenticatorSession(
             )
             return
         }
-        requestPromptCount++
+        promptTimes.addLast(nowMillis)
 
         pendingRequest = request
         _state.value = SessionState.AwaitingApproval(request)
@@ -353,20 +737,46 @@ class AuthenticatorSession(
         activity: androidx.fragment.app.FragmentActivity,
         executor: Executor,
         availability: BiometricAvailability,
-    ) {
-        val request = pendingRequest ?: return
+    ): androidx.biometric.BiometricPrompt? {
+        val request = pendingRequest ?: return null
+
+        // Prepare the signature *before* the prompt. Keystore authorises this exact
+        // object when the biometric succeeds; it is not enough to authenticate and
+        // then create a fresh Signature, which would be refused as unauthenticated.
+        //
+        // An existing operation can only belong to this same pending request (a
+        // second request is rejected while one is being decided). It is reused when
+        // the activity was recreated, for example after a rotation, because the
+        // Signature is still the object Keystore will authorise.
+        val operation = signingOperation ?: run {
+            val prepared = key.beginSigning(request.signingInput())
+            if (prepared == null) {
+                reject(request, ErrorCode.BIOMETRIC_FAILED)
+                _state.value = SessionState.Denied(
+                    request.requestId.toHex(),
+                    "the device key could not prepare a signature; re-pairing may be required",
+                )
+                return null
+            }
+            signingOperation = prepared
+            prepared
+        }
+
         // The operator's approval is bound to this exact request id.
         approvedRequestId = request.requestId.toHex()
         _state.value = SessionState.AwaitingBiometric(request)
 
-        authenticateStrong(
+        return authenticateStrong(
             activity = activity,
             executor = executor,
             availability = availability,
             title = "Linux authentication",
             subtitle = request.username,
             description = describe(request),
-            onResult = { outcome -> onBiometricResult(request, outcome) },
+            cryptoObject = androidx.biometric.BiometricPrompt.CryptoObject(
+                operation.signature,
+            ),
+            onResult = { outcome -> onBiometricResult(request, operation, outcome) },
         )
     }
 
@@ -375,6 +785,10 @@ class AuthenticatorSession(
      */
     fun reject(request: AuthRequest, reason: ErrorCode = ErrorCode.USER_CANCELLED) {
         approvedRequestId = null
+        signingOperation = null
+        // The request is settled. Leaving it pending would let a later link loss
+        // overwrite the operator-visible denial with a misleading reason.
+        if (pendingRequest?.requestId == request.requestId) pendingRequest = null
         _state.value = SessionState.Denied(request.requestId.toHex(), "declined")
         send(
             Message.AuthRejectMessage(
@@ -383,11 +797,24 @@ class AuthenticatorSession(
         )
     }
 
-    private fun onBiometricResult(request: AuthRequest, outcome: BiometricOutcome) {
+    private fun onBiometricResult(
+        request: AuthRequest,
+        operation: DeviceAuthKey.SigningOperation,
+        outcome: BiometricOutcome,
+    ) {
+        if (signingOperation !== operation) {
+            // The request was declined or the link was lost while the prompt was up.
+            // A late success must not authorise anything.
+            return
+        }
         when (outcome) {
-            is BiometricOutcome.Succeeded -> signAndSend(request)
+            is BiometricOutcome.Succeeded -> {
+                signingOperation = null
+                signAndSend(request, operation)
+            }
             is BiometricOutcome.NotRecognised -> Unit // the prompt is still up
             is BiometricOutcome.Failed -> {
+                signingOperation = null
                 val reason = when (outcome.code) {
                     androidx.biometric.BiometricPrompt.ERROR_NEGATIVE_BUTTON,
                     androidx.biometric.BiometricPrompt.ERROR_USER_CANCELED,
@@ -400,6 +827,7 @@ class AuthenticatorSession(
             is BiometricOutcome.Unavailable -> {
                 // A device that cannot satisfy the strong-biometric policy must say
                 // so plainly rather than quietly proceed.
+                signingOperation = null
                 reject(request, ErrorCode.BIOMETRIC_FAILED)
                 _state.value = SessionState.Denied(
                     request.requestId.toHex(),
@@ -428,9 +856,15 @@ class AuthenticatorSession(
      * separator, the protocol version and exactly the ten signed fields. Nothing
      * else is signed, so no unsigned display text can gain authority.
      */
-    private fun signAndSend(request: AuthRequest) {
-        // The biometric that just succeeded must belong to *this* request.
-        if (approvedRequestId != request.requestId.toHex()) {
+    private fun signAndSend(
+        request: AuthRequest,
+        operation: DeviceAuthKey.SigningOperation,
+    ) {
+        // The biometric that just succeeded must belong to *this* request, still be
+        // the request on screen, and use the object the prompt authorised.
+        if (approvedRequestId != request.requestId.toHex() ||
+            pendingRequest?.requestId != request.requestId
+        ) {
             reject(request, ErrorCode.INTERNAL)
             _state.value = SessionState.Denied(
                 request.requestId.toHex(),
@@ -438,10 +872,12 @@ class AuthenticatorSession(
             )
             return
         }
-        val signature = key.sign(request.signingInput())
+        val signature = operation.sign()
         if (signature == null) {
             // Keystore refused: no recent strong authentication, or the key was
             // invalidated by a re-enrollment. Either way this is a denial.
+            approvedRequestId = null
+            pendingRequest = null
             reject(request, ErrorCode.BIOMETRIC_FAILED)
             _state.value = SessionState.Denied(
                 request.requestId.toHex(),
@@ -449,7 +885,17 @@ class AuthenticatorSession(
             )
             return
         }
-        val publicKeyBytes = key.publicKeyBytes() ?: return
+        val publicKeyBytes = key.publicKeyBytes()
+        if (publicKeyBytes == null) {
+            approvedRequestId = null
+            pendingRequest = null
+            reject(request, ErrorCode.INTERNAL)
+            _state.value = SessionState.Denied(
+                request.requestId.toHex(),
+                "the device public key is unavailable",
+            )
+            return
+        }
         val response = AuthResponse(
             requestId = request.requestId,
             deviceId = deviceId,
@@ -480,16 +926,24 @@ class AuthenticatorSession(
     // Transport plumbing
     // -----------------------------------------------------------------------
 
-    /** Set by the transport layer; kept abstract so both transports work. */
-    var sender: ((Frame) -> Unit)? = null
-
     private fun send(frame: Frame) {
-        sender?.invoke(frame)
+        transportSink?.invoke(frame)
     }
 
-    private var requestPromptCount = 0
+    /** Prompt timestamps inside the current rate-limit window. */
+    private val promptTimes = ArrayDeque<Long>()
 
     private companion object {
         const val MAX_PROMPTS_PER_WINDOW = 5
+        const val PROMPT_WINDOW_MS = 60_000L
+
+        /**
+         * How long a verified pairing waits for the operator's Allow tap.
+         *
+         * The host's pairing session has its own TTL. Keeping the phone's parked
+         * record shorter than that would be surprising; keeping it forever would
+         * block every later pairing.
+         */
+        const val PAIRING_CONFIRMATION_TIMEOUT_MS = 120_000L
     }
 }

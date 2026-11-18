@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use android_fprint_protocol::errors::{ErrorCode, ProtocolError};
 use android_fprint_protocol::messages::Message;
+use android_fprint_protocol::pairing::CodeEntry;
 use android_fprint_protocol::types::{Id, Transport};
 use phone_auth_sim::{Behaviour, Device, DeviceKey, KnownHost, Misbehaviour};
 use phone_authd::engine::{AuthContext, AuthOutcome, PairingPhase};
@@ -635,6 +636,70 @@ async fn authentication_is_rate_limited() {
     assert!(
         denials > 0,
         "repeated attempts must eventually be rate limited"
+    );
+}
+
+#[tokio::test]
+async fn host_entry_mode_requires_the_correct_code_before_persisting() {
+    let engine = new_engine();
+    let device = Arc::new(DeviceKey::generate("host-entry").unwrap());
+    engine
+        .begin_pairing_with_mode(None, CodeEntry::Host, "test".into())
+        .expect("pairing opens");
+    assert_eq!(engine.pairing_code_entry(), Some(CodeEntry::Host));
+
+    let (host_side, device_side) = tokio::io::duplex(64 * 1024);
+    let engine_conn = engine.clone();
+    let conn = tokio::spawn(async move {
+        let c = transport::open(engine_conn, host_side, Transport::Wifi, "test".into());
+        c.run(10).await
+    });
+    let device2 = device.clone();
+    let sim = tokio::spawn(async move {
+        let mut dev = Device::new(
+            device2,
+            device_side,
+            Misbehaviour {
+                on_request: None,
+                behaviour: Behaviour::Approve,
+            },
+        );
+        let Some(Message::SessionHello(hello)) = dev.recv().await.unwrap() else {
+            return;
+        };
+        let _ = dev.hello_ack(&hello).await;
+        let Some(Message::PairingStart(start)) = dev.recv().await.unwrap() else {
+            return;
+        };
+        let _ = dev.pair(&start, true).await;
+    });
+
+    wait_for_phase(&engine, PairingPhase::AwaitingConfirmation).await;
+    let correct = engine.pairing_code().expect("derived code").0;
+    let wrong = format!(
+        "{:06}",
+        (correct.parse::<u32>().expect("six-digit code") + 1) % 1_000_000
+    );
+
+    let err = engine
+        .confirm_pairing_with_code(Some(&wrong))
+        .expect_err("a wrong host-entered code must be refused");
+    assert_eq!(err.code(), ErrorCode::ContextMismatch);
+    assert!(
+        engine.list_devices().is_empty(),
+        "a wrong code must not create a device record"
+    );
+
+    engine
+        .confirm_pairing_with_code(Some(&correct))
+        .expect("the correct host-entered code is accepted");
+    sim.await.expect("device task");
+    conn.await
+        .expect("connection task")
+        .expect("connection closed cleanly");
+    assert_eq!(
+        engine.device_status(&device.device_id),
+        Some(DeviceStatus::Paired)
     );
 }
 

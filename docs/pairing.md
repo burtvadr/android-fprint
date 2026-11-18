@@ -10,11 +10,13 @@ system like this is subverted.
 host                                   device
  │  PAIRING_START { session_id,         │
  │                  host_id, host_pubkey,│
- │                  code?, expires_at,   │
+ │                  code?, code_entry,   │
+ │                  expires_at,          │
  │                  host_nonce }         │
  ├──────────────────────────────────────►│
  │                                       │  derive p from both nonces
- │                                       │  display the six-digit code
+ │                                       │  device: never show the code
+ │                                       │  host: show the code
  │  PAIRING_SUBMIT { session_id,         │
  │                   device_id,          │
  │                   device_name,        │
@@ -22,16 +24,24 @@ host                                   device
  │                   device_nonce,       │
  │                   mac }               │
  │◄──────────────────────────────────────┤
- │  derive the same p                     │
- │  display the code                     │
- │  ── operator confirms both match ──   │
+ │  derive the same p and code           │
+ │  device: display the code             │
+ │  host: prompt for the phone's code    │
  │  verify mac                           │
  │  persist the device                   │
  │  PAIRING_RESULT { status, host_mac }  │
  ├──────────────────────────────────────►│  verify host_mac
+ │                                       │  device: type the host code
+ │                                       │  host: show code, require Allow
+ │                                       │  persist only after the human gate
 ```
 
-Two properties are worth calling out.
+`code_entry` chooses which endpoint types the code. In `device` mode the Linux
+host displays it and the phone never does. In `host` mode the phone displays it
+and the Linux host never does. The endpoint that displays the code must not accept
+a bare confirmation in place of the other endpoint's typed value.
+
+Three properties are worth calling out.
 
 **The code is derived, not transported.** It is a function of *both* nonces. The
 host cannot compute it before the device contributes its nonce, and the device
@@ -40,8 +50,35 @@ the exchange is necessarily two rounds, and both sides compute the code
 independently.
 
 **The MACs are reciprocal.** Each side proves it derived the same secret. The
-operator's comparison is therefore not just a human ritual: if the MACs verify,
-the codes the operator compared really did cover this exchange.
+operator's code entry is therefore not just a human ritual: if the MACs verify,
+the code the operator typed really did cover this exchange.
+
+## Phone-side consent
+
+A valid `host_mac` proves that the host derived the same transcript. It does not
+prove that a human was involved. The Android app's gate depends on `code_entry`:
+
+* **`device` mode (default):** the phone never displays the code. It parks the
+  verified pairing in `PairingAwaitingConfirmation` and asks the operator to type
+  the six-digit code shown on the Linux screen. A wrong value is rejected and can
+  be retried until the pairing expires. Typing the correct code is the consent;
+  there is no separate Allow tap.
+* **`host` mode:** the phone displays the code for the Linux operator to type.
+  After the host proves it derived the same transcript, the phone still requires
+  an explicit **Allow**. The code entry is a host-side check, not a substitute
+  for the phone's consent.
+
+Only the human gate writes the host key and certificate pin. **Cancel**, the back
+gesture, or losing the connection discards the pending record. The host has
+already persisted its own side when it sends `PAIRING_RESULT`; the two records are
+independent. A host record alone cannot authenticate anything: the phone refuses
+requests from a host it has not stored. The phone's typed code or Allow is what
+makes future authentication possible.
+
+Pairing can be started while the app is in the background. The foreground service
+holds an idle discovery/connection loop, and the state that needs the operator
+brings the screen forward (subject to Android's overlay or full-screen-intent
+permission).
 
 ## Operator-chosen codes
 
@@ -49,14 +86,15 @@ the codes the operator compared really did cover this exchange.
 checks its own derived value against it and refuses immediately on a mismatch;
 the host verifies the same equality before persisting.
 
-This turns "compare two screens and trust a human" into "compare one screen and
-trust a commitment", and is the safer option where it is practical. Prefer it.
+This turns the human check into a pre-shared code, but the selected `code_entry`
+still applies: type it on the endpoint that did not choose it. It is the safer
+option where it is practical.
 
 ## What the operator is protected against
 
 | Attack | Outcome |
 |---|---|
-| A different device is substituted in transit | Its MAC differs, so the host rejects it. The operator's code comparison cannot succeed. |
+| A different device is substituted in transit | Its MAC differs, so the host rejects it. The operator's code entry cannot match the host's transcript. |
 | A different host is substituted | It cannot produce `host_mac`, so the device rejects it. |
 | Replay of an earlier pairing | Both nonces are fresh CSPRNG output per attempt, so the derived code and MACs differ. |
 | Passive capture of the exchange | The transcript yields the session secret, but that secret is short-lived and no long-term key is transmitted. Only public keys are retained. |
@@ -83,8 +121,24 @@ bug:
 
 There is no mode in which a device that merely *appears* on the network becomes
 trusted. `phone-authctl pair` must be run, it expires, a second attempt is refused
-while one is open, and the host cannot persist anything until the operator has
-confirmed the code. There is deliberately no code path that skips that.
+while one is open, the host persists only after its own human gate, and the phone
+persists only after typing the host's code (or, in `host` mode, after typing the
+phone's code on the host plus an explicit Allow). Neither side's record is usable
+without the other's.
+
+## Phone-initiated unpair
+
+The phone can remove a host without root on the Linux side. It deletes the host
+record and certificate pin immediately, then sends `UNPAIR {token}` on the pinned
+link if the host is reachable. The host stores only `SHA-256(token)` and marks the
+matching record revoked.
+
+If the host is offline, the local unpair still stands. The phone keeps the token
+and includes it in the next pairing submit for that host. After the new pairing's
+MAC verifies, the host revokes the old record matching the token and then commits
+the new one. This is a cleanup capability, not proof of same-installation
+identity: a lost token means the host operator must revoke the stale record
+manually.
 
 ## Revocation
 
@@ -96,7 +150,9 @@ Revocation takes effect immediately: the registry entry is marked revoked, the l
 connection is dropped, and the next attempt is refused with `REVOKED`. Replacing a
 phone requires a new pairing with a new key, and the registry refuses to
 re-register a `device_id` against a different key without an explicit revocation
-first, so a stale identifier cannot be silently taken over.
+first, so a stale identifier cannot be silently taken over. A valid
+`cleanup_token` in a new pairing submit is an explicit revocation of the old
+record; without one, the operator still has to run this command.
 
 ## Rate limiting
 

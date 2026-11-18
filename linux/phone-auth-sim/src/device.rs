@@ -407,6 +407,7 @@ where
             device_key_id: self.device.key_id_hex(),
             device_nonce,
             mac,
+            cleanup_tokens: Vec::new(),
         };
         self.send(&Message::PairingSubmit(submit)).await?;
 
@@ -458,7 +459,7 @@ where
         println!(
             "[phone] Host {} trusted (key {}).",
             &start.host_id.to_hex()[..8],
-            &start.host_pubkey.short_fingerprint()
+            start.host_pubkey.short_fingerprint()
         );
         Ok(result)
     }

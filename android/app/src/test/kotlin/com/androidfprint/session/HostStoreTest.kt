@@ -135,6 +135,16 @@ class HostStoreTest {
     }
 
     @Test
+    fun `revocation token survives the codec`() {
+        val original = host(7).copy(revocationToken = ByteArray(32) { it.toByte() })
+        val restored = HostCodec.decodeAll(HostCodec.encodeAll(listOf(original))).single()
+        assertTrue(
+            "the revocation token must survive a store round-trip",
+            original.revocationToken!!.contentEquals(restored.revocationToken),
+        )
+    }
+
+    @Test
     fun `a corrupt record is rejected rather than half-parsed`() {
         // Better to load nothing and let the user re-pair than to load a record whose
         // fields were guessed at.

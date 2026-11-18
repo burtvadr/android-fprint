@@ -16,6 +16,8 @@ data class KnownHost(
     /** The host's TLS certificate, pinned so a proxy cannot intercept. */
     val pinnedCertificate: X509Certificate?,
     val hostName: String,
+    /** Bearer capability for a phone-initiated unpair; never used to authenticate. */
+    val revocationToken: ByteArray? = null,
 ) {
     // data class equality on ByteArray is reference equality, which would make two
     // records loaded from disk never compare equal to the one just paired. Every
@@ -27,7 +29,11 @@ data class KnownHost(
         return hostId.toHex() == other.hostId.toHex() &&
             keyId == other.keyId &&
             publicKeyBytes.contentEquals(other.publicKeyBytes) &&
-            hostName == other.hostName
+            hostName == other.hostName &&
+            ((revocationToken == null && other.revocationToken == null) ||
+                (revocationToken != null &&
+                    other.revocationToken != null &&
+                    revocationToken.contentEquals(other.revocationToken)))
     }
 
     override fun hashCode(): Int {
@@ -35,6 +41,7 @@ data class KnownHost(
         result = 31 * result + keyId.hashCode()
         result = 31 * result + publicKeyBytes.contentHashCode()
         result = 31 * result + hostName.hashCode()
+        result = 31 * result + (revocationToken?.contentHashCode() ?: 0)
         return result
     }
 }
@@ -163,11 +170,14 @@ internal object HostCodec {
         // The label is operator-visible text and may contain anything, including the
         // separators below, so it is base64url encoded like the binary fields.
         b64url(host.hostName.toByteArray(Charsets.UTF_8)),
+        host.revocationToken?.let { b64(it) } ?: NO_CERT,
     ).joinToString(separator = FIELD)
 
     private fun decode(line: String): KnownHost {
         val parts = line.split(FIELD)
-        require(parts.size == 5) { "a host record needs exactly 5 fields, got ${parts.size}" }
+        require(parts.size == 5 || parts.size == 6) {
+            "a host record needs 5 or 6 fields, got ${parts.size}"
+        }
         val publicKey = Base64.getDecoder().decode(parts[2])
         require(publicKey.size == PUBLIC_KEY_LEN) {
             "a host public key must be $PUBLIC_KEY_LEN bytes, got ${publicKey.size}"
@@ -179,12 +189,22 @@ internal object HostCodec {
                 .generateCertificate(ByteArrayInputStream(Base64.getDecoder().decode(parts[3])))
                 as X509Certificate
         }
+        val revocationToken = if (parts.size < 6 || parts[5] == NO_CERT) {
+            null
+        } else {
+            Base64.getDecoder().decode(parts[5]).also {
+                require(it.size == REVOCATION_TOKEN_LEN) {
+                    "a revocation token must be $REVOCATION_TOKEN_LEN bytes"
+                }
+            }
+        }
         return KnownHost(
             hostId = Id.fromHex(parts[0]),
             keyId = parts[1],
             publicKeyBytes = publicKey,
             pinnedCertificate = cert,
             hostName = String(Base64.getUrlDecoder().decode(parts[4]), Charsets.UTF_8),
+            revocationToken = revocationToken,
         )
     }
 
@@ -206,4 +226,5 @@ internal object HostCodec {
     private const val FIELD = "\u001F"
     private const val NO_CERT = "-"
     private const val PUBLIC_KEY_LEN = 65
+    private const val REVOCATION_TOKEN_LEN = 32
 }

@@ -174,7 +174,8 @@ a broken peer rather than a normal condition.
 | 11 | `SESSION_HELLO_ACK` | device → host | §7.2 |
 | 12 | `AUTH_REQUEST` | host → device | §8.1 |
 | 13 | `AUTH_RESPONSE` | device → host | §8.2 |
-| 14 | `AUTH_REJECT` | device → host | §8.3 |
+| 14 | `AUTH_REJECT` | device → host | §8.4 |
+| 15 | `UNPAIR` | device → host | §6.5 |
 | 20 | `ERROR` | either | §9 |
 
 Unassigned codes MUST be answered with `ERROR` / `UNSUPPORTED_VERSION`.
@@ -184,7 +185,16 @@ Unassigned codes MUST be answered with `ERROR` / `UNSUPPORTED_VERSION`.
 ## 6. Pairing
 
 Pairing establishes mutual, authenticated knowledge of both public keys and is
-gated on **both** endpoint displays. Discovery alone never authorises anything.
+gated on an out-of-band six-digit code: one endpoint displays it, and the operator
+types it on the other. Discovery alone never authorises anything.
+
+A pairing session selects the entry direction with `code_entry`:
+
+* `device` (the default): the Linux host displays the code and the phone requires
+  the operator to type it. The phone never displays it.
+* `host`: the phone displays the code and the Linux host requires the operator to
+  type it. The host never displays it. The phone still requires an explicit Allow
+  before it stores the host.
 
 A pairing session is single-use and expires (`PAIRING_TTL`, §11). The host MUST
 refuse to begin pairing unless an operator has explicitly started a pairing
@@ -194,11 +204,12 @@ session (`phone-authctl pair`). There MUST NOT be a permanent pairing mode.
 host                                   device
  │  PAIRING_START  {session_id,          │
  │                  host_id, host_pubkey,│
- │                  code?,                │
+ │                  code?, code_entry,   │
  │                  expires_at,           │
  │                  host_nonce}           │
  ├──────────────────────────────────────►│  derive p from both nonces
- │                                       │  display the six-digit code
+ │                                       │  device: never display the code
+ │                                       │  host: display the code
  │  PAIRING_SUBMIT {session_id,          │
  │                   device_id,           │
  │                   device_name,         │
@@ -208,13 +219,17 @@ host                                   device
  │                   mac}                 │
  │◄──────────────────────────────────────┤
  │  derive the same p, derive the code   │
- │  display the code, ask the operator   │
- │  to confirm both screens match        │
+ │  device: display the code             │
+ │  host: ask the operator for the       │
+ │  phone's code and verify it            │
  │  verify mac against the session secret│
  │  persist device                       │
  │  PAIRING_RESULT {session_id,           │
  │                   status, host_mac}    │
  ├──────────────────────────────────────►│  verify host_mac
+ │                                       │  device: type the host's code
+ │                                       │  host: show code, require Allow
+ │                                       │  persist only after the human gate
 ```
 
 ### 6.0 Why the code is derived, not transported
@@ -227,12 +242,13 @@ necessarily two rounds, and the code is computed on both sides rather than sent.
 An operator may pre-select a code with `phone-authctl pair --code 123456`. In that
 case the host sends it in `PAIRING_START`, the device checks its own derived code
 against it and fails immediately on a mismatch, and the host verifies the same
-equality before persisting. This turns "compare two screens" into "compare one
-screen and trust a commitment", and is the safer option when it is practical.
+equality before persisting. This turns the human check into one code, entered on
+the endpoint that did not choose it.
 
-When no code is pre-selected, the host MUST display its derived code and MUST
-obtain an explicit positive confirmation from the operator before it verifies or
-persists anything. There is no unattended pairing path.
+When no code is pre-selected, the endpoint named by `code_entry` MUST display the
+derived code and the other endpoint MUST require the operator to type it. The
+displaying endpoint MUST NOT accept a bare confirmation tap in place of the other
+endpoint's typed code. There is no unattended pairing path.
 
 ### 6.1 `PAIRING_START`
 
@@ -243,6 +259,7 @@ persists anything. There is no unattended pairing path.
 | `host_pubkey` | bstr | 65 bytes, §3.1 |
 | `host_key_id` | tstr | 64 lowercase hex chars |
 | `code` | tstr | six ASCII digits, or empty when the operator chose none |
+| `code_entry` | tstr | `device` (default when absent) or `host`; which endpoint types the code |
 | `expires_at` | uint | Unix seconds |
 | `host_nonce` | bstr | 32 bytes |
 
@@ -257,6 +274,7 @@ persists anything. There is no unattended pairing path.
 | `device_key_id` | tstr | 64 hex chars |
 | `device_nonce` | bstr | 32 bytes |
 | `mac` | bstr | 32 bytes, §6.4 |
+| `cleanup_tokens` | array of bstr | Optional; each 32 bytes. Older pairings this phone asks the host to revoke, §6.6 |
 
 ### 6.3 `PAIRING_RESULT`
 
@@ -265,13 +283,14 @@ persists anything. There is no unattended pairing path.
 | `session_id` | bstr | 16 bytes |
 | `status` | uint | `0` = paired, `1` = rejected |
 | `host_mac` | bstr | 32 bytes, present only when `status == 0` |
+| `revocation_token` | bstr | 32 bytes, present when `status == 0`; bearer capability for §6.5 |
 
 ### 6.4 Pairing confirmation (normative)
 
 The purpose of this construction is to bind the *whole pairing transcript* to the
-code the operator verified. Without it, an off-path attacker could relay a
+code the operator entered. Without it, an off-path attacker could relay a
 substitute device key to a device and a substitute host key to the host, and the
-operator would have verified a code that authenticates neither.
+operator would have entered a code that authenticates neither.
 
 ```text
 p = HMAC-SHA-256(key = pairing_secret, msg = "ALP-PAIR-V1" || 0x00 || session_id)
@@ -282,7 +301,13 @@ pairing_secret = HKDF-SHA-256(
         info = session_id,
         len  = 32)
 
-code   = decimal, zero-padded to 6 digits, of (p[0] mod 1_000_000)
+code   = decimal, zero-padded to 6 digits, from rejection sampling:
+         for each 32-bit big-endian word v in p:
+             if v < 4_294_000_000: code = v mod 1_000_000; stop
+         if no word qualifies:
+             p_1 = HMAC-SHA-256(key = p,
+                     msg = "ALP-PAIR-CODE-V1" || 0x00 || u64_be(1))
+             repeat with p_1, p_2, ...
 mac_d  = HMAC-SHA-256(key = p, msg =
           "ALP-DEVICE-CONFIRM-V1" || 0x00
        || session_id || host_id || device_id
@@ -293,12 +318,47 @@ mac_h  = HMAC-SHA-256(key = p, msg =
        || host_pubkey || device_pubkey || host_nonce || device_nonce)
 ```
 
+The code MUST use rejection sampling as above. A one-byte truncation would
+reduce the space to `000000`–`000255`; a bare modulo reduction over a non-multiple
+of `1_000_000` would be biased. Rejection sampling makes every six-digit value
+exactly equally likely. The probability of a code in `000xxx` is therefore 0.1%.
+The expansion is reached with probability about `6e-30`.
+
 Requirements:
 
-* The host MUST verify `mac_d` before persisting anything (§11.4 ordering), and
-  MUST do so only after the operator has confirmed the code comparison.
-* The device MUST verify `host_mac` before persisting the host key.
-* `code`, `mac`, `mac_d` and `host_mac` MUST NOT be written to logs.
+* The host MUST verify `mac_d` before persisting anything (§11.4 ordering).
+  When `code_entry = device`, it MUST display the derived code and MUST obtain
+  explicit positive confirmation from its operator before persisting. When
+  `code_entry = host`, it MUST NOT display the code, MUST require its operator to
+  type the code shown on the phone, and MUST verify that entry before persisting;
+  a wrong entry MUST be rejected and MUST NOT be converted into a default or a
+  successful pairing.
+* The device MUST verify `host_mac` before persisting the host key. When
+  `code_entry = device`, it MUST NOT display the code, MUST require the operator
+  to type the code displayed by the host, and MUST persist only on an exact match.
+  A wrong entry MUST be rejected without persisting; the operator MAY retry until
+  expiry. When `code_entry = host`, the device MAY display the code for the host
+  operator to type, but it MUST still require an explicit **Allow** before
+  persisting.
+* **Cancel**, the back gesture, expiry, timeout, or loss of the pairing link MUST
+  discard the pending result. There MUST NOT be a default-allow, silent, or
+  unattended confirmation path.
+* The host persists its record when it sends `PAIRING_RESULT` with `status = 0`;
+  the two sides persist independently. A host-side record alone authenticates
+  nothing: the device MUST reject session establishment and authentication from a
+  `host_id` it has not stored. The phone's human gate — a typed code or an
+  explicit Allow — is what authorises future authentication.
+* The host MUST generate a fresh 32-byte `revocation_token` for every successful
+  pairing, return it only over the pinned TLS channel, and store only its SHA-256
+  hash with the device record. The token MUST NOT be logged. The device MUST store
+  it with the host record and MUST NOT treat it as an authentication credential.
+* Pending `cleanup_tokens` in `PAIRING_SUBMIT` MUST be processed only after
+  `mac_d` verifies and before the new record is persisted. Each token revokes
+  exactly the record whose token hash matches. A token MUST NOT be treated as
+  evidence that the new installation is the same phone; it only authorises the
+  old pairing's cleanup.
+* `code`, `mac`, `mac_d`, `host_mac` and `revocation_token` MUST NOT be written
+  to logs.
 * Both `host_nonce` and `device_nonce` MUST be fresh CSPRNG output for every
   pairing attempt. Reuse breaks the transcript binding.
 * Pairing carries **no long-term key material**; only long-lived public keys are
@@ -311,13 +371,46 @@ Requirements:
 transcript, not an information-theoretic Short Authentication String as in
 SPAKE2/PAKE. Its guarantees are: (a) a MITM must know or influence both nonces to
 make its substituted keys verify under the displayed code; (b) a MITM that does
-not control `PAIRING_START` cannot substitute keys without the operator's code
-check failing. It does not provide forward secrecy — an attacker who records the
+not control `PAIRING_START` cannot substitute keys without the code entry
+failing. It does not provide forward secrecy — an attacker who records the
 pairing transcript and later obtains the device's private key can recompute `p`.
 Use over a transport with an authenticating channel (TLS, as on Wi-Fi) where
 available; for the BLE transport, pairing SHOULD be performed over Wi-Fi. This
 limitation is a deliberate, documented trade-off, not an oversight, and is
 tracked as a known weakness rather than papered over.
+
+---
+
+### 6.5 `UNPAIR` (device → host)
+
+| Key | Type | Constraint |
+|---|---|---|
+| `token` | bstr | 32 bytes, the `revocation_token` from §6.3 |
+
+A device may revoke its own pairing by sending `UNPAIR`. The host MUST compute
+`SHA-256(token)`, find the record whose stored revocation-token hash matches, mark
+that record revoked, audit the event, and close the connection. The token is a
+bearer capability: it authorises revocation only, never authentication, and MUST
+NOT be logged.
+
+A device MUST remove its local host record even when the host is unreachable or
+does not answer. The local decision is final; `UNPAIR` is the best-effort
+notification that lets the host clean its side.
+
+### 6.6 Pending cleanup on re-pair
+
+A device that could not deliver `UNPAIR` MAY retain the token and send it in
+`cleanup_tokens` on the next `PAIRING_SUBMIT` for the same host. The host MUST
+process those tokens only after the new submit's `mac` verifies and before it
+persists the new record. Each valid token revokes exactly the old record it
+belongs to; invalid tokens are ignored and audited, not used as a reason to
+break an otherwise valid pairing.
+
+`cleanup_tokens` are bearer capabilities, not proof of same-installation
+identity. A new key may replace an old record after its token revokes the old
+record; without a token, an id already paired with a different key remains
+refused (§11.3). A lost token means the host operator must revoke the stale
+record manually.
 
 ---
 
@@ -595,8 +688,11 @@ from one that was factory-reset.
 **Re-pairing.** Re-pairing an existing `(host_id, device_id)` pair with the **same**
 key on both sides updates metadata (label, timestamps) and MUST NOT be treated as
 an error. Re-pairing an id already known with a **different** key MUST be refused
-(§11.4 step 3). A user who replaced their phone's key therefore gets a refusal
-rather than a silently new identity, which is the point.
+(§11.4 step 3), unless a valid `cleanup_token` in the same submit first revokes the
+old record (§6.6). A token is a bearer cleanup capability, not proof of
+same-installation identity; without one, the old record must be revoked by the host
+operator. A user who replaced their phone's key therefore gets a refusal rather
+than a silently new identity, which is the point.
 
 **Rate limiting.** `RATE_PAIRING` and `RATE_AUTH` are counted per
 `(host, device)` pair, not globally on either side. A user with several paired PCs
@@ -607,12 +703,17 @@ paired.
 ### 11.4 Ordering requirement (host, on `PAIRING_SUBMIT`)
 
 1. Verify `mac_d` against the session secret (§6.4).
-2. Check the device is not already known with a different key.
-3. Check `device_id` is not already registered to a different key.
-4. **Only then** persist the device record and increment pairing rate limit.
+2. Process `cleanup_tokens`: revoke every old record whose stored token hash
+   matches. Invalid tokens are ignored and audited.
+3. Check the device is not already known with a different key among records that
+   remain paired.
+4. Check `device_id` is not already registered to a different key among records
+   that remain paired.
+5. **Only then** persist the device record and increment pairing rate limit.
 
 Verification precedes persistence. A failed `mac_d` MUST NOT create a registry
-entry, not even a "pending" one.
+entry, not even a "pending" one, and MUST NOT revoke anything through
+`cleanup_tokens`.
 
 ---
 
@@ -648,11 +749,13 @@ Service type: `_android-fprint._tcp.local.`
 |---|---|
 | `v` | `1` |
 | `id` | `device_id` as hex |
-| `name` | device label, informational |
+| `name` | host label, informational; SHOULD be the machine hostname |
 | `fp` | first 16 hex chars of `key_id` |
 | `caps` | `auth` |
 
 MUST NOT be published: keys, secrets, tokens, usernames, or derived material.
+The `name` label is operator-facing only and MUST NOT be treated as identity or
+trust evidence; the paired key and TLS pin remain authoritative.
 
 The TLS peer MUST be verified against the paired host identity. Because a
 self-signed host certificate with a self-generated keypair cannot by itself be
@@ -712,7 +815,8 @@ MUST log: device label, `device_id` hex, username, purpose, service, result,
 `request_id` hex, transport, timings.
 
 MUST NOT log: private keys, session secrets, `challenge` values, signatures,
-pairing codes or MACs, TLS payloads, biometric data.
+pairing codes or MACs, `revocation_token` or `cleanup_tokens`, TLS payloads,
+biometric data.
 
 Anyone with the logs MUST NOT be able to reconstruct a credential. Since
 `challenge` values are single-use, logging them is unnecessary risk; the

@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/libexec/phone-authd
+ExecStart=/usr/libexec/phone-authd --host-name %H
 ExecReload=/bin/kill -HUP $MAINPID
 
 # The daemon verifies signatures and enforces policy. It needs no privilege beyond

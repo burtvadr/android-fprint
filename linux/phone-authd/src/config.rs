@@ -36,6 +36,9 @@ pub struct Config {
     /// networks with multicast filtered, for example). Never a trust anchor:
     /// the address only decides where to send the first packet.
     pub device_endpoint: Option<SocketEndpoint>,
+    /// Optional operator-visible host label. The systemd unit passes `%H` so the
+    /// sandboxed daemon still reports the machine's real hostname.
+    pub host_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +58,7 @@ impl Default for Config {
             advertise_mdns: true,
             transport: android_fprint_protocol::types::Transport::Wifi,
             device_endpoint: None,
+            host_name: None,
         }
     }
 }
@@ -72,6 +76,7 @@ impl Config {
             advertise_mdns: false,
             transport: android_fprint_protocol::types::Transport::Wifi,
             device_endpoint: None,
+            host_name: Some("test-host".into()),
         }
     }
 

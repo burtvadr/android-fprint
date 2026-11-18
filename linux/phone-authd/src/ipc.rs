@@ -122,6 +122,9 @@ pub enum ControlRequest {
         /// Six ASCII digits. The daemon generates one when absent.
         #[serde(default)]
         code: Option<String>,
+        /// Which endpoint types the code: `device` (default) or `host`.
+        #[serde(default)]
+        code_entry: Option<String>,
         #[serde(default)]
         timeout_ms: Option<u64>,
     },
@@ -145,8 +148,12 @@ pub enum ControlRequest {
     Revoke { device: String },
     /// Fetch the pairing code for an in-progress pairing session.
     PairingCode,
-    /// Record the operator's confirmation that both screens matched.
-    ConfirmPairing,
+    /// Record the operator's confirmation. In `host` mode this carries the code
+    /// the operator typed from the phone; the daemon verifies it before persisting.
+    ConfirmPairing {
+        #[serde(default)]
+        code: Option<String>,
+    },
 }
 
 fn default_purpose() -> String {

@@ -49,8 +49,8 @@ class WifiTransport(
      */
     fun advertise(deviceId: String, keyIdShort: String, port: Int, name: String): NsdServiceInfo {
         val info = NsdServiceInfo()
-        info.serviceName = "$name [$deviceId.take(8)}]"
-        info.serviceType = Limits.SERVICE_TYPE
+        info.serviceName = "$name [${deviceId.take(8)}]"
+        info.serviceType = nsdServiceType()
         info.port = port
         // `NsdServiceInfo.setProperty` is not public API on all supported levels, so
         // the TXT records are assembled through the documented attribute and
@@ -128,7 +128,7 @@ class WifiTransport(
                 Log.w(TAG, "stop discovery failed: $errorCode")
             }
         }
-        nsd.discoverServices(Limits.SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, listener)
+        nsd.discoverServices(nsdServiceType(), NsdManager.PROTOCOL_DNS_SD, listener)
 
         // Discovery callbacks are not guaranteed to fire, so poll for the deadline.
         Thread {
@@ -190,6 +190,7 @@ class WifiTransport(
     }
 
     @Throws(IOException::class)
+    @Synchronized
     fun send(frame: Frame) {
         val out = output ?: throw IOException("not connected")
         out.write(frame.encode())
@@ -244,6 +245,17 @@ class WifiTransport(
 
     private companion object {
         const val TAG = "WifiTransport"
+
+        /**
+         * Android's NsdManager wants the service type without the `.local.` suffix;
+         * it appends the local domain itself. The protocol constant carries the
+         * fully-qualified DNS-SD name, so trim it here rather than changing what
+         * goes on the wire.
+         */
+        fun nsdServiceType(): String =
+            Limits.SERVICE_TYPE.removeSuffix(".local.").let {
+                if (it.endsWith('.')) it else "$it."
+            }
     }
 }
 

@@ -42,16 +42,56 @@ pub fn advertise(
         ("name", host_name),
         ("caps", "auth"),
     ];
-    let info = mdns_sd::ServiceInfo::new(
-        android_fprint_protocol::SERVICE_TYPE,
-        host_name,
-        host_name,
-        config.bind_addr.ip().to_string(),
-        config.tcp_port,
-        &props[..],
-    )
-    .map_err(|e| ProtocolError::Internal(format!("mDNS service info: {e}")))?;
-    let _ = daemon.register(info);
+    // The daemon needs a DNS hostname, not just a label. Host labels can contain
+    // characters that mDNS rejects, and the crate requires the `.local.` suffix
+    // explicitly, so derive one that is always valid.
+    let mdns_host = {
+        let label: String = host_name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .take(63)
+            .collect();
+        let label = label.trim_matches('-');
+        if label.is_empty() {
+            "phone-authd.local.".to_string()
+        } else {
+            format!("{label}.local.")
+        }
+    };
+    // A wildcard bind address is not a routable address. Advertising `0.0.0.0`
+    // would tell devices to connect nowhere, so let the daemon publish the host's
+    // real interface addresses instead.
+    let info = if config.bind_addr.ip().is_unspecified() {
+        mdns_sd::ServiceInfo::new(
+            android_fprint_protocol::SERVICE_TYPE,
+            host_name,
+            &mdns_host,
+            (),
+            config.tcp_port,
+            &props[..],
+        )
+        .map_err(|e| ProtocolError::Internal(format!("mDNS service info: {e}")))?
+        .enable_addr_auto()
+    } else {
+        mdns_sd::ServiceInfo::new(
+            android_fprint_protocol::SERVICE_TYPE,
+            host_name,
+            &mdns_host,
+            config.bind_addr.ip(),
+            config.tcp_port,
+            &props[..],
+        )
+        .map_err(|e| ProtocolError::Internal(format!("mDNS service info: {e}")))?
+    };
+    daemon
+        .register(info)
+        .map_err(|e| ProtocolError::Internal(format!("mDNS register: {e}")))?;
     Ok(daemon)
 }
 

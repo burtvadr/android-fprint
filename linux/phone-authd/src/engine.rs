@@ -16,7 +16,7 @@ use android_fprint_protocol::frame::Frame;
 use android_fprint_protocol::messages::Message;
 use android_fprint_protocol::nonce::ReplayGuard;
 use android_fprint_protocol::pairing::{
-    PairingResult, PairingSession, PairingStart, PairingSubmit,
+    CodeEntry, PairingResult, PairingSession, PairingStart, PairingSubmit,
 };
 use android_fprint_protocol::ratelimit::{Limit, RateLimiter};
 use android_fprint_protocol::types::{
@@ -125,6 +125,8 @@ struct ActivePairing {
     session: PairingSession,
     /// Operator-chosen code, if any.
     chosen: Option<String>,
+    /// Which endpoint must type the derived code.
+    code_entry: CodeEntry,
     /// Code both sides derived, available once the device has submitted.
     derived: Option<String>,
     phase: PairingPhase,
@@ -410,6 +412,16 @@ impl Engine {
         code: Option<String>,
         peer_key: String,
     ) -> Result<(Option<String>, u64)> {
+        self.begin_pairing_with_mode(code, CodeEntry::Device, peer_key)
+    }
+
+    /// Opens a pairing session with an explicit code-entry direction.
+    pub fn begin_pairing_with_mode(
+        self: &Arc<Self>,
+        code: Option<String>,
+        code_entry: CodeEntry,
+        peer_key: String,
+    ) -> Result<(Option<String>, u64)> {
         let now = android_fprint_protocol::unix_now();
         {
             let mut rp = self.rate_pairing.lock().expect("rate mutex");
@@ -458,6 +470,7 @@ impl Engine {
             *guard = Some(ActivePairing {
                 session,
                 chosen: chosen.clone(),
+                code_entry,
                 derived: None,
                 phase: PairingPhase::AwaitingDevice,
                 confirmed: Arc::new(AtomicBool::new(false)),
@@ -482,15 +495,17 @@ impl Engine {
                 "elapsed_secs": a.elapsed(now),
                 "expires_at": a.expires_at,
                 "opened_by": a.opened_by(),
+                "code_entry": a.code_entry.as_str(),
             })
         })
     }
 
-    /// The code to show the operator.
+    /// The code to show the operator, when this mode displays it.
     ///
     /// Before the device submits this is the operator-chosen code; afterwards it
-    /// is the code derived from both nonces, which is the value the phone is
-    /// displaying and the one the operator must compare.
+    /// is the code derived from both nonces. In [`CodeEntry::Host`] mode the host
+    /// must not display this value: the phone displays it. The caller decides
+    /// whether showing it is safe based on [`Engine::pairing_code_entry`].
     pub fn pairing_code(&self) -> Option<(String, u64)> {
         self.pairing.lock().ok().and_then(|g| {
             g.as_ref().map(|a| {
@@ -504,6 +519,14 @@ impl Engine {
         })
     }
 
+    /// Which endpoint is required to type the derived code.
+    pub fn pairing_code_entry(&self) -> Option<CodeEntry> {
+        self.pairing
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|a| a.code_entry))
+    }
+
     pub fn pairing_phase(&self) -> PairingPhase {
         self.pairing
             .lock()
@@ -512,10 +535,23 @@ impl Engine {
             .unwrap_or(PairingPhase::AwaitingDevice)
     }
 
-    /// Records the operator's confirmation that both screens showed the same
-    /// code. Until this is called the pairing connection task stays blocked and
-    /// nothing is persisted.
+    /// Records the operator's confirmation for the default phone-entry mode.
+    ///
+    /// Kept for callers that do not need to supply a code; the real work is in
+    /// [`Engine::confirm_pairing_with_code`].
     pub fn confirm_pairing(&self) -> Result<()> {
+        self.confirm_pairing_with_code(None)
+    }
+
+    /// Records the operator's confirmation, verifying the code when the host is
+    /// the endpoint that must type it.
+    ///
+    /// In [`CodeEntry::Device`] mode the host displays the code and the phone
+    /// verifies the typed value, so no code is needed here. In
+    /// [`CodeEntry::Host`] mode the phone displays the code, and the host MUST
+    /// prove it was typed by supplying it; a wrong value leaves the session open
+    /// for a retry and never persists anything.
+    pub fn confirm_pairing_with_code(&self, entered_code: Option<&str>) -> Result<()> {
         let notify = {
             let mut g = self
                 .pairing
@@ -526,6 +562,29 @@ impl Engine {
                 return Err(ProtocolError::BadRequest(
                     "no device has submitted a pairing request yet".into(),
                 ));
+            }
+            if a.code_entry == CodeEntry::Host {
+                let expected = a.derived.as_deref().ok_or_else(|| {
+                    ProtocolError::Internal("pairing code is not available yet".into())
+                })?;
+                let entered = entered_code.ok_or_else(|| {
+                    ProtocolError::BadRequest(
+                        "the host must enter the code shown on the phone".into(),
+                    )
+                })?;
+                if entered.len() != expected.len()
+                    || !android_fprint_protocol::crypto::ct_eq_slice(
+                        entered.as_bytes(),
+                        expected.as_bytes(),
+                    )
+                {
+                    self.audit
+                        .write(&Event::new("pairing_code_mismatch").denied("CONTEXT_MISMATCH"));
+                    return Err(ProtocolError::ContextMismatch(
+                        "the entered pairing code does not match".into(),
+                    ));
+                }
+                self.audit.write(&Event::new("pairing_code_verified"));
             }
             a.phase = PairingPhase::Confirmed;
             a.confirmed.store(true, Ordering::SeqCst);
@@ -605,8 +664,9 @@ impl Engine {
             Ok(Ok(s)) => s,
         };
 
-        // Derive the shared secret and publish the code the operator must
-        // compare. Nothing is verified or persisted until they confirm.
+        // Derive the shared secret and publish the code. The selected mode decides
+        // which endpoint displays it and which endpoint must type it. Nothing is
+        // verified or persisted until the operator confirmation gate.
         {
             // The code is a pure function of (session_id, host_nonce,
             // device_nonce), so it can be derived here for display and again in
@@ -630,7 +690,7 @@ impl Engine {
             a.derived = Some(derived);
             a.phase = PairingPhase::AwaitingConfirmation;
         }
-        self.audit.write(&Event::new("pairing_code_displayed"));
+        self.audit.write(&Event::new("pairing_code_ready"));
 
         // Block until the operator confirms, the session expires, or we time out.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
@@ -722,13 +782,35 @@ impl Engine {
             &submit.device_pubkey,
         )?;
 
-        // Only now is anything persisted.
+        // A new pairing can carry cleanup tokens from older pairings. These are
+        // bearer capabilities, not proof of same-installation identity: each token
+        // lets us find and revoke exactly the old record it belongs to. Process
+        // them only after the new pairing's MAC verified, and before upserting the
+        // new record, so a new key can replace an old one.
+        let revocation_token: [u8; 32] = android_fprint_protocol::crypto::random_array()?;
+        let revocation_token_hash =
+            hex::encode(android_fprint_protocol::crypto::sha256(&revocation_token));
         let mut reg = self.registry.lock().expect("registry mutex");
-        reg.upsert_paired(
+        for token in &submit.cleanup_tokens {
+            let hash = hex::encode(android_fprint_protocol::crypto::sha256(token));
+            if let Some(revoked) = reg.revoke_by_token_hash(&hash)? {
+                self.audit.write(
+                    &Event {
+                        kind: "pairing_cleanup",
+                        device_id: Some(revoked.to_hex()),
+                        ..Event::new("pairing_cleanup")
+                    }
+                    .success(),
+                );
+            }
+        }
+        // Only now is anything persisted.
+        reg.upsert_paired_with_token(
             submit.device_id,
             &submit.device_name,
             &submit.device_pubkey,
             now,
+            Some(&revocation_token_hash),
         )
         .map_err(|e| {
             self.audit
@@ -752,7 +834,35 @@ impl Engine {
             session_id: submit.session_id,
             status: 0,
             host_mac: Some(host_mac),
+            revocation_token: Some(revocation_token),
         })
+    }
+
+    /// Revokes the record matching a device-held revocation token.
+    ///
+    /// The token is a bearer capability, so this works even when the phone has
+    /// already forgotten the host and connects with a fresh identity. Returns the
+    /// revoked device id for auditing.
+    pub fn revoke_by_token(&self, token: &[u8; 32]) -> Result<Option<Id>> {
+        let hash = hex::encode(android_fprint_protocol::crypto::sha256(token));
+        let revoked = {
+            let mut reg = self
+                .registry
+                .lock()
+                .map_err(|_| ProtocolError::Internal("registry mutex poisoned".into()))?;
+            reg.revoke_by_token_hash(&hash)?
+        };
+        if let Some(id) = revoked {
+            self.audit.write(
+                &Event {
+                    kind: "device_unpaired",
+                    device_id: Some(id.to_hex()),
+                    ..Event::new("device_unpaired")
+                }
+                .success(),
+            );
+        }
+        Ok(revoked)
     }
 
     /// Builds the `PAIRING_START` frame for an open session.
@@ -768,6 +878,7 @@ impl Engine {
             host_pubkey: self.host.public_key(),
             host_key_id: self.host.public_key().key_id_hex(),
             code: code.to_owned(),
+            code_entry: active.code_entry,
             expires_at: active.expires_at.max(now),
             host_nonce: active.session.host_nonce,
         };
@@ -1239,6 +1350,7 @@ impl Engine {
                 "active": true,
                 "expires_at": expires,
                 "seconds_remaining": expires.saturating_sub(android_fprint_protocol::unix_now()),
+                "code_entry": self.pairing_code_entry().map(|m| m.as_str()),
             })),
         })
     }

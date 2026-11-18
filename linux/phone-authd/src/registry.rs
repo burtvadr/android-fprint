@@ -55,6 +55,9 @@ pub struct DeviceRecord {
     #[serde(default)]
     pub last_seen: Option<u64>,
     pub status: DeviceStatus,
+    /// SHA-256 of the bearer token that authorizes this device to revoke itself.
+    #[serde(default)]
+    pub revocation_token_hash: Option<String>,
     /// Number of successful authentications, for operator visibility.
     #[serde(default)]
     pub auth_count: u64,
@@ -236,8 +239,25 @@ impl Registry {
         pk: &PublicKey,
         now: u64,
     ) -> Result<()> {
+        self.upsert_paired_with_token(device_id, name, pk, now, None)
+    }
+
+    /// Same as [`Registry::upsert_paired`], recording the revocation token hash.
+    pub fn upsert_paired_with_token(
+        &mut self,
+        device_id: Id,
+        name: &str,
+        pk: &PublicKey,
+        now: u64,
+        revocation_token_hash: Option<&str>,
+    ) -> Result<()> {
         if let Some(existing) = self.devices.get(&device_id) {
-            if existing.public_key != hex::encode(pk.as_bytes()) {
+            // A revoked record may be replaced by a fresh pairing, including one
+            // with a new key. A still-usable record may only be replaced by the
+            // same key; otherwise this is an identity takeover attempt.
+            if existing.public_key != hex::encode(pk.as_bytes())
+                && existing.status.may_authenticate()
+            {
                 return Err(ProtocolError::BadRequest(format!(
                     "device {} is already paired with a different key; revoke it first",
                     device_id.short()
@@ -251,6 +271,7 @@ impl Registry {
             added_at: now,
             last_seen: Some(now),
             status: DeviceStatus::Paired,
+            revocation_token_hash: revocation_token_hash.map(str::to_owned),
             auth_count: 0,
         };
         self.devices.insert(device_id, rec);
@@ -263,6 +284,24 @@ impl Registry {
         rec.status = DeviceStatus::Revoked;
         self.dirty = true;
         self.save()
+    }
+
+    /// Revokes the device whose revocation-token hash matches, if any.
+    ///
+    /// The token is a bearer capability; no device identity or signature is
+    /// needed. Returns the revoked device id for auditing.
+    pub fn revoke_by_token_hash(&mut self, hash: &str) -> Result<Option<Id>> {
+        let id = self
+            .devices
+            .iter()
+            .find(|(_, rec)| rec.revocation_token_hash.as_deref() == Some(hash))
+            .map(|(id, _)| *id);
+        if let Some(id) = id {
+            self.revoke(&id)?;
+            Ok(Some(id))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Removes a device entirely and returns it. Used by `pair --replace`, which
@@ -520,6 +559,43 @@ mod tests {
         assert_eq!(a.host_id, b.host_id);
         assert_eq!(a.public_key(), b.public_key());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revocation_token_lookup_revokes_only_the_matching_record() {
+        let mut r = Registry::in_memory();
+        let a = Id::random().unwrap();
+        let b = Id::random().unwrap();
+        r.upsert_paired_with_token(a, "Pixel A", &pk(1), 10, Some("hash-a"))
+            .unwrap();
+        r.upsert_paired_with_token(b, "Pixel B", &pk(2), 10, Some("hash-b"))
+            .unwrap();
+
+        assert_eq!(r.revoke_by_token_hash("hash-b").unwrap(), Some(b));
+        assert_eq!(
+            r.get(&a).unwrap().status,
+            DeviceStatus::Paired,
+            "unrelated token must not revoke the other device"
+        );
+        assert_eq!(r.get(&b).unwrap().status, DeviceStatus::Revoked);
+        assert_eq!(r.revoke_by_token_hash("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn a_revoked_record_can_be_replaced_with_a_new_key() {
+        let mut r = Registry::in_memory();
+        let id = Id::random().unwrap();
+        r.upsert_paired_with_token(id, "Pixel", &pk(1), 10, Some("old"))
+            .unwrap();
+        r.revoke(&id).unwrap();
+        r.upsert_paired_with_token(id, "Pixel 2", &pk(2), 20, Some("new"))
+            .unwrap();
+        assert_eq!(r.get(&id).unwrap().status, DeviceStatus::Paired);
+        assert!(r.resolve_authenticating(&id).is_ok());
+        assert_eq!(
+            r.get(&id).unwrap().revocation_token_hash.as_deref(),
+            Some("new")
+        );
     }
 
     #[test]

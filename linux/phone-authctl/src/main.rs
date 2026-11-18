@@ -7,6 +7,7 @@
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
+use android_fprint_protocol::pairing::CodeEntry;
 use phone_authd::ipc::{ControlRequest, ControlResponse};
 
 const DEFAULT_SOCKET: &str = phone_authd::config::DEFAULT_SOCKET;
@@ -20,8 +21,10 @@ fn usage() -> ! {
          COMMANDS:\n\
          \x20   list                      show paired authenticators\n\
          \x20   status                    daemon status\n\
-         \x20   pair                      pair a phone; compare the displayed code on both screens\n\
+         \x20   pair                      pair a phone; one side shows the code, the other types it\n\
          \x20   pair --code NNNNNN       pair using an operator-chosen code\n\
+         \x20   pair --code-entry device  host shows the code; type it on the phone (default)\n\
+         \x20   pair --code-entry host    phone shows the code; type it in this terminal\n\
          \x20   authenticate --user U    ask a phone to authenticate a Linux user\n\
          \x20   revoke --device D        revoke an authenticator immediately (root only)\n\
          \n\
@@ -33,7 +36,7 @@ fn usage() -> ! {
          \x20   --operation O    authenticate or authorize         (default authenticate)\n\
          \x20   --device D       device name or id (default: any connected authenticator)\n\
          \x20   --timeout MS     how long to wait                     (default 90000)\n\
-         \x20   --yes            skip the interactive code confirmation\n\
+         \x20   --yes            skip the host confirmation prompt (never the code entry)\n\
          \x20   -h, --help       show this help\n\
          \n\
          The 'authenticate' command performs no cryptography here: it asks the\n\
@@ -53,6 +56,7 @@ struct Args {
     operation: String,
     device: Option<String>,
     code: Option<String>,
+    code_entry: CodeEntry,
     timeout_ms: u64,
     assume_yes: bool,
 }
@@ -67,6 +71,7 @@ fn parse() -> Args {
         operation: "authenticate".into(),
         device: None,
         code: None,
+        code_entry: CodeEntry::Device,
         timeout_ms: phone_authd::server::DEFAULT_AUTH_TIMEOUT_MS,
         assume_yes: false,
     };
@@ -99,6 +104,17 @@ fn parse() -> Args {
             "--operation" => args.operation = v("--operation"),
             "--device" => args.device = Some(v("--device")),
             "--code" => args.code = Some(v("--code")),
+            "--code-entry" => {
+                let value = v("--code-entry");
+                args.code_entry = match value.as_str() {
+                    "device" => CodeEntry::Device,
+                    "host" => CodeEntry::Host,
+                    other => {
+                        eprintln!("error: --code-entry must be device or host, got {other:?}");
+                        usage();
+                    }
+                };
+            }
             "--timeout" => args.timeout_ms = v("--timeout").parse().unwrap_or(90_000),
             "--yes" | "-y" => args.assume_yes = true,
             "-h" | "--help" => usage(),
@@ -198,7 +214,7 @@ fn cmd_list(args: &Args) {
         let key = d.get("key_id").and_then(|v| v.as_str()).unwrap_or("");
         println!(
             "    key:     SHA256:{}...",
-            &key.chars().take(16).collect::<String>()
+            key.chars().take(16).collect::<String>()
         );
         println!("    status:  {status}");
         println!("    link:    {avail}");
@@ -261,12 +277,17 @@ fn cmd_status(args: &Args) {
     }
 }
 
-/// Interactive pairing: open a session, show the code, require confirmation.
+/// Interactive pairing.
+///
+/// In `device` mode the host displays the code and the phone must type it. In
+/// `host` mode the phone displays the code and this terminal must type it. The
+/// endpoint that displays the code never accepts a bare confirmation.
 fn cmd_pair(args: &Args) {
     let resp = request(
         args,
         &ControlRequest::Pair {
             code: args.code.clone(),
+            code_entry: Some(args.code_entry.as_str().to_string()),
             timeout_ms: Some(args.timeout_ms.max(1000)),
         },
     )
@@ -289,19 +310,28 @@ fn cmd_pair(args: &Args) {
         .and_then(|r| r.get("seconds_remaining"))
         .and_then(|v| v.as_i64())
         .unwrap_or(120);
-    if let Some(c) = &chosen {
-        println!("Pairing open for {remaining}s.");
-        println!("You chose the code {c}. The phone must show the same code.");
-    } else {
-        println!("Pairing open for {remaining}s.");
-        println!("Start pairing on the phone now.");
+    println!("Pairing open for {remaining}s.");
+    match args.code_entry {
+        CodeEntry::Device => {
+            if chosen.is_some() {
+                println!("You chose a code; it will be shown here and must be typed on the phone.");
+            } else {
+                println!("Start pairing on the phone now.");
+            }
+        }
+        CodeEntry::Host => {
+            println!(
+                "Start pairing on the phone now. The phone displays the code; this terminal will not."
+            );
+            if chosen.is_some() {
+                println!("You chose the code, but still type it from the phone when asked.");
+            }
+        }
     }
     println!();
 
-    // Wait for the device to submit, which is when the comparable code exists.
-    let mut shown: Option<String> = None;
-    #[allow(clippy::never_loop)]
-    loop {
+    // Wait until the device has submitted and both sides can derive the code.
+    let code = loop {
         let st = match request(args, &ControlRequest::PairingCode) {
             Ok(r) if r.ok => r,
             Ok(r) => fail(&r),
@@ -310,45 +340,82 @@ fn cmd_pair(args: &Args) {
                 std::process::exit(1)
             }
         };
-        let code = st
+        let phase = st
+            .result
+            .as_ref()
+            .and_then(|r| r.get("phase"))
+            .and_then(|p| p.as_str())
+            .unwrap_or("");
+        let candidate = st
             .result
             .as_ref()
             .and_then(|r| r.get("code"))
             .and_then(|c| c.as_str())
             .unwrap_or("");
-        if !code.is_empty() && shown.as_deref() != Some(code) {
-            shown = Some(code.to_string());
-            let _ = &shown;
-            println!("Pairing code shown on both screens:");
+        if (phase.eq_ignore_ascii_case("awaitingconfirmation")
+            || phase.eq_ignore_ascii_case("confirmed"))
+            && !candidate.is_empty()
+        {
+            break candidate.to_string();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+
+    let confirmation = match args.code_entry {
+        CodeEntry::Device => {
+            println!("Pairing code (shown only here; enter it on the phone):");
             println!();
             println!("      ┌────────────────┐");
             println!("      │  {code}  │");
             println!("      └────────────────┘");
             println!();
-            println!("Compare it with the phone. If they match, confirm here.");
             if args.assume_yes {
-                println!("--yes given: confirming without asking.");
-                break;
+                println!(
+                    "--yes given: skipping the host confirmation prompt. The phone still requires the code."
+                );
+            } else {
+                print!("Send this pairing to the phone? [y/N] ");
+                let _ = std::io::stdout().flush();
+                let mut answer = String::new();
+                if std::io::stdin().read_line(&mut answer).is_err() {
+                    println!("\nno confirmation read; aborting pairing");
+                    std::process::exit(1);
+                }
+                if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+                    println!("Pairing not confirmed; nothing was stored.");
+                    std::process::exit(1);
+                }
             }
-            print!("Do the codes match? [y/N] ");
-            let _ = std::io::stdout().flush();
-            let mut answer = String::new();
-            if std::io::stdin().read_line(&mut answer).is_err() {
-                println!("\nno confirmation read; aborting pairing");
-                let _ = request(args, &ControlRequest::ConfirmPairing);
-                std::process::exit(1);
-            }
-            if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
-                println!("Pairing not confirmed; nothing was stored.");
-                let _ = request(args, &ControlRequest::ConfirmPairing);
-                std::process::exit(1);
-            }
-            break;
+            None
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
+        CodeEntry::Host => {
+            println!("The phone is displaying the pairing code. Type it here:");
+            let entered = loop {
+                print!("Code: ");
+                let _ = std::io::stdout().flush();
+                let mut answer = String::new();
+                match std::io::stdin().read_line(&mut answer) {
+                    Ok(0) => {
+                        println!("\nno code read; aborting pairing");
+                        std::process::exit(1);
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        println!("\nno code read; aborting pairing");
+                        std::process::exit(1);
+                    }
+                }
+                let entered: String = answer.chars().filter(|c| c.is_ascii_digit()).collect();
+                if entered == code {
+                    break entered;
+                }
+                println!("That code does not match the phone. Try again.");
+            };
+            Some(entered)
+        }
+    };
 
-    match request(args, &ControlRequest::ConfirmPairing) {
+    match request(args, &ControlRequest::ConfirmPairing { code: confirmation }) {
         Ok(r) if r.ok => {}
         Ok(r) => fail(&r),
         Err(e) => {
@@ -358,25 +425,33 @@ fn cmd_pair(args: &Args) {
     }
     println!("Confirming pairing…");
 
-    // Wait for the daemon to persist the device. The device connection closes as
-    // soon as pairing finishes, so success is "a new device exists", not "a
-    // device is connected".
+    match args.code_entry {
+        CodeEntry::Device => {
+            println!("Host record saved. Enter the code on the phone to finish pairing.")
+        }
+        CodeEntry::Host => {
+            println!("Host record saved. Approve the pairing on the phone to finish.")
+        }
+    }
+
+    // Wait for the daemon to finish the host side. The phone may still be asking
+    // for its own confirmation; that is deliberately independent.
     for _ in 0..150 {
         std::thread::sleep(std::time::Duration::from_millis(200));
         let Ok(r) = request(args, &ControlRequest::Status) else {
             continue;
         };
         let Some(res) = &r.result else { continue };
-        let paired = res
-            .get("paired_devices")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        if paired > 0 {
-            println!("Paired.");
+        let still_open = res
+            .get("pairing")
+            .and_then(|p| p.get("seconds_remaining"))
+            .is_some();
+        if !still_open {
+            println!("Host side pairing finished.");
             return;
         }
     }
-    println!("Pairing did not complete; check `phone-authctl status`.");
+    println!("Host did not finish pairing; check `phone-authctl status`.");
     std::process::exit(1);
 }
 

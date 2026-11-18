@@ -29,6 +29,7 @@ fn usage() -> ! {
          \x20   --port N           TCP port for the Wi-Fi transport (default 47123)\n\
          \x20   --transport T      transport preference: wifi or ble\n\
          \x20   --device HOST:PORT fixed device endpoint, used when mDNS is unavailable\n\
+         \x20   --host-name NAME   operator-visible host label (default from the hostname)\n\
          \x20   --no-mdns          do not advertise over DNS-SD\n\
          \x20   --check            validate configuration and exit\n\
          \x20   -h, --help         show this help\n",
@@ -109,6 +110,7 @@ fn parse_args() -> Args {
                     }
                 }
             }
+            "--host-name" => config.host_name = Some(value("--host-name")),
             "--no-mdns" => config.advertise_mdns = false,
             "--check" => check = true,
             "-h" | "--help" => usage(),

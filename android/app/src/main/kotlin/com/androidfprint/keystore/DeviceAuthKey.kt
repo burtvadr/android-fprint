@@ -130,28 +130,60 @@ class DeviceAuthKey(
         }.getOrDefault(false)
 
     /**
-     * Signs [message] with the device key.
+     * Prepares a signature that the biometric prompt will authorise.
      *
-     * Returns null when Keystore refuses, which happens if no strong biometric was
-     * verified, if the key was invalidated by a re-enrollment, or if the device
-     * was locked. A null result MUST be treated as a denial, never as an approval.
+     * The key is configured to require a fresh strong-biometric check for every
+     * use, so a `Signature` must be created and initialised *before* the prompt and
+     * handed to `BiometricPrompt` as a `CryptoObject`. Creating a new `Signature`
+     * after the prompt returns does not work: Keystore has authorised that one
+     * object, not the process, and the fresh one is rejected with
+     * `UserNotAuthenticatedException`.
+     *
+     * Returns null when the key cannot be used at all (missing, invalidated by a
+     * biometric re-enrolment, or otherwise unavailable). A null result MUST be
+     * treated as a denial.
      */
-    fun sign(message: ByteArray): ByteArray? = try {
+    fun beginSigning(message: ByteArray): SigningOperation? = try {
         val privateKey = keyStore.getKey(alias, null) as? PrivateKey ?: return null
-        // `SHA256withECDSA` produces DER; the protocol wants raw r||s.
-        val der = Signature.getInstance(SIGNATURE_ALGORITHM).run {
+        val signature = Signature.getInstance(SIGNATURE_ALGORITHM).apply {
             initSign(privateKey)
-            update(message)
-            sign()
         }
-        derToRaw(der)
+        SigningOperation(signature, message)
     } catch (e: android.security.keystore.KeyPermanentlyInvalidatedException) {
         // Biometrics changed. The key is now unusable and the device must be
         // re-paired with a new key.
         null
     } catch (e: Exception) {
-        // UserNotAuthenticatedException and every other failure are denials.
+        // Every other failure is also a denial.
         null
+    }
+
+    /**
+     * A signature prepared for exactly one message and one biometric prompt.
+     *
+     * [sign] may be called once. Until the prompt succeeds, Keystore refuses to
+     * produce a signature; after it succeeds, this is the object that carries the
+     * authorisation.
+     */
+    class SigningOperation internal constructor(
+        /** The object that `BiometricPrompt.CryptoObject` must wrap. */
+        val signature: Signature,
+        private val message: ByteArray,
+    ) {
+        private var used = false
+
+        /** Completes the signature, or returns null if Keystore refuses. */
+        fun sign(): ByteArray? = try {
+            if (used) {
+                null
+            } else {
+                used = true
+                signature.update(message)
+                derToRaw(signature.sign())
+            }
+        } catch (e: Exception) {
+            null
+        }
     }
 
     /** The public key, encoded as a raw uncompressed point (65 bytes). */

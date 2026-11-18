@@ -2,7 +2,7 @@
 
 use crate::errors::{ProtocolError, Result};
 use crate::frame::Frame;
-use crate::pairing::{PairingResult, PairingStart, PairingSubmit};
+use crate::pairing::{PairingResult, PairingStart, PairingSubmit, Unpair};
 use crate::types::{
     AuthReject, AuthRequest, AuthResponse, ErrorMsg, SessionHello, SessionHelloAck,
 };
@@ -15,9 +15,10 @@ pub const MSG_SESSION_HELLO_ACK: u16 = 11;
 pub const MSG_AUTH_REQUEST: u16 = 12;
 pub const MSG_AUTH_RESPONSE: u16 = 13;
 pub const MSG_AUTH_REJECT: u16 = 14;
+pub const MSG_UNPAIR: u16 = 15;
 pub const MSG_ERROR: u16 = 20;
 
-pub const MESSAGE_NAMES: [(u16, &str); 9] = [
+pub const MESSAGE_NAMES: [(u16, &str); 10] = [
     (MSG_PAIRING_START, "PAIRING_START"),
     (MSG_PAIRING_SUBMIT, "PAIRING_SUBMIT"),
     (MSG_PAIRING_RESULT, "PAIRING_RESULT"),
@@ -26,6 +27,7 @@ pub const MESSAGE_NAMES: [(u16, &str); 9] = [
     (MSG_AUTH_REQUEST, "AUTH_REQUEST"),
     (MSG_AUTH_RESPONSE, "AUTH_RESPONSE"),
     (MSG_AUTH_REJECT, "AUTH_REJECT"),
+    (MSG_UNPAIR, "UNPAIR"),
     (MSG_ERROR, "ERROR"),
 ];
 
@@ -47,6 +49,7 @@ pub enum Message {
     AuthRequest(AuthRequest),
     AuthResponse(AuthResponse),
     AuthReject(AuthReject),
+    Unpair(Unpair),
     Error(ErrorMsg),
 }
 
@@ -61,6 +64,7 @@ impl Message {
             Message::AuthRequest(_) => MSG_AUTH_REQUEST,
             Message::AuthResponse(_) => MSG_AUTH_RESPONSE,
             Message::AuthReject(_) => MSG_AUTH_REJECT,
+            Message::Unpair(_) => MSG_UNPAIR,
             Message::Error(_) => MSG_ERROR,
         }
     }
@@ -79,6 +83,7 @@ impl Message {
             Message::AuthRequest(m) => m.to_payload(),
             Message::AuthResponse(m) => m.to_payload(),
             Message::AuthReject(m) => m.to_payload(),
+            Message::Unpair(m) => m.to_payload(),
             Message::Error(m) => m.to_payload(),
         }
     }
@@ -124,6 +129,7 @@ impl Message {
                     reason,
                 })
             }
+            MSG_UNPAIR => Message::Unpair(Unpair::from_payload(&f.payload)?),
             MSG_ERROR => Message::Error(ErrorMsg::from_payload(&f.payload)?),
             other => return Err(ProtocolError::UnknownMessage(other)),
         })

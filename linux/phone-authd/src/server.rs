@@ -8,12 +8,13 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
 use android_fprint_protocol::errors::{ProtocolError, Result};
+use android_fprint_protocol::pairing::CodeEntry;
 use android_fprint_protocol::types::Transport;
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::audit::Event;
-use crate::config::{self, Config, CONTROL_GROUP};
+use crate::config::{self, Config};
 use crate::engine::Engine;
 use crate::ipc::{self, ControlRequest, ControlResponse};
 use crate::transport;
@@ -48,17 +49,15 @@ pub fn bind_control_socket(path: &std::path::Path) -> Result<UnixListener> {
         .map_err(|e| ProtocolError::Internal(format!("register listener: {e}")))
 }
 
-/// Makes the socket reachable by root and the `phone-auth` group only.
+/// Makes the socket reachable by root and the service group only.
+///
+/// The daemon's primary group is `phone-auth` under systemd, so the socket is
+/// already created with the right group. Do not spawn `chgrp`: the sandbox
+/// forbids the extra privilege transition, and the attempt produces a coredump
+/// on every start while changing nothing.
 fn restrict_socket(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
-    // Chown to the control group when we are privileged enough to do so. If the
-    // group does not exist yet the socket stays root-owned, which is still safe:
-    // only root can connect.
-    let _ = std::process::Command::new("chgrp")
-        .arg(CONTROL_GROUP)
-        .arg(path)
-        .status();
 }
 
 /// Serves the control socket until `shutdown` fires.
@@ -154,31 +153,48 @@ async fn dispatch(
                 "code": code,
                 "expires_at": expires_at,
                 "phase": format!("{:?}", engine.pairing_phase()).to_lowercase(),
+                "code_entry": engine.pairing_code_entry().map(|m| m.as_str()),
             })),
             None => ControlResponse::ok(serde_json::json!({ "active": false })),
         },
 
         ControlRequest::Pair {
             code,
+            code_entry,
             timeout_ms: _,
         } => {
+            let mode = match code_entry.as_deref() {
+                None | Some("device") => CodeEntry::Device,
+                Some("host") => CodeEntry::Host,
+                Some(other) => {
+                    return ControlResponse::from_protocol_error(&ProtocolError::BadRequest(
+                        format!("unknown code_entry {other:?}; expected device or host"),
+                    ))
+                }
+            };
             let peer_key = format!("uid:{}", peer.uid);
-            match engine.begin_pairing(code, peer_key) {
+            match engine.begin_pairing_with_mode(code, mode, peer_key) {
                 Ok((chosen, expires_at)) => ControlResponse::ok(serde_json::json!({
                     "chosen_code": chosen,
                     "expires_at": expires_at,
                     "seconds_remaining": expires_at.saturating_sub(android_fprint_protocol::unix_now()),
                     "phase": "awaiting_device",
-                    "instructions": "Start pairing on the phone now. The code to compare appears here once it connects.",
+                    "code_entry": mode.as_str(),
+                    "instructions": match mode {
+                        CodeEntry::Device => "Enter the code shown here on the phone.",
+                        CodeEntry::Host => "Enter the code shown on the phone here.",
+                    },
                 })),
                 Err(e) => ControlResponse::from_protocol_error(&e),
             }
         }
 
-        ControlRequest::ConfirmPairing => match engine.confirm_pairing() {
-            Ok(()) => ControlResponse::ok(serde_json::json!({ "confirmed": true })),
-            Err(e) => ControlResponse::from_protocol_error(&e),
-        },
+        ControlRequest::ConfirmPairing { code } => {
+            match engine.confirm_pairing_with_code(code.as_deref()) {
+                Ok(()) => ControlResponse::ok(serde_json::json!({ "confirmed": true })),
+                Err(e) => ControlResponse::from_protocol_error(&e),
+            }
+        }
 
         ControlRequest::Authenticate {
             user,

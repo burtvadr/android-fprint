@@ -51,7 +51,8 @@ impl Daemon {
         let audit = AuditLog::to_file(&config.audit_log)
             .map_err(|e| format!("cannot open audit log {}: {e}", config.audit_log.display()))?
             .with_echo(echo_audit);
-        let engine = Engine::new(host, registry, audit, host_name());
+        let name = config.host_name.clone().unwrap_or_else(host_name);
+        let engine = Engine::new(host, registry, audit, name);
         Ok(Daemon { config, engine })
     }
 
@@ -71,9 +72,10 @@ impl Daemon {
             .map_err(|e| format!("cannot load host identity: {e}"))?;
         let registry = Registry::load(&config.registry_path())
             .map_err(|e| format!("cannot load device registry: {e}"))?;
+        let name = config.host_name.clone().unwrap_or_else(host_name);
         Ok(Daemon {
             config,
-            engine: Engine::new(host, registry, AuditLog::null(), host_name()),
+            engine: Engine::new(host, registry, AuditLog::null(), name),
         })
     }
 

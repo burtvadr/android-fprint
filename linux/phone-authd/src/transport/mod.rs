@@ -142,6 +142,7 @@ where
                             session_id: sid,
                             status: 1,
                             host_mac: None,
+                            revocation_token: None,
                         });
                         let _ = tx_for_pairing.send(reject.to_frame());
                         let err = Message::Error(
@@ -194,6 +195,22 @@ where
                                 // registered device identity.
                                 Ok(Message::PairingSubmit(submit)) => {
                                     self.engine.deliver_pairing(submit);
+                                }
+                                // A device may revoke itself with the bearer token
+                                // issued at pairing. This works after local unpair,
+                                // when the phone no longer has a host record.
+                                Ok(Message::Unpair(unpair)) => {
+                                    match self.engine.revoke_by_token(&unpair.token) {
+                                        Ok(Some(_)) => break,
+                                        Ok(None) => {
+                                            self.send_error(&ProtocolError::NotPaired, None).await;
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            self.send_error(&e, None).await;
+                                            break;
+                                        }
+                                    }
                                 }
                                 Ok(m) => match self.device_id {
                                     Some(d) => self.engine.deliver(&d, m),
