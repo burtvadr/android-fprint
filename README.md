@@ -20,6 +20,8 @@ signature over a fresh challenge instead of trusting a transmitted `YES`.
   <img src="media/icons/auto/android-fprint-light.svg" width="180" alt="Light icon" />
 </p>
 
+<p align="center"><sub>Fingerprint mark adapted from <a href="https://www.svgrepo.com/svg/246819/fingerprint">SVG Repo's Security 15 collection</a> (CC0), heavily modified.</sub></p>
+
 ```text
 $ phone-authctl authenticate --user alice --purpose sudo
 
@@ -329,6 +331,15 @@ one device and is revocable independently.
 * [`docs/architecture.md`](docs/architecture.md) — layering and component map
 * [`docs/threat-model.md`](docs/threat-model.md) — adversaries, defences, limitations
 * [`docs/pairing.md`](docs/pairing.md) — the pairing flow and its guarantees
+
+## Credits
+
+The fingerprint mark is a heavily modified derivative of the
+["Fingerprint" icon from the Security 15 collection](https://www.svgrepo.com/svg/246819/fingerprint)
+on SVG Repo. The collection is published under the
+[CC0 license](https://www.svgrepo.com/page/licensing/#CC0) and uploaded by SVG
+Repo; no individual artist is listed. The icons in `media/icons/` and the Android
+launcher assets are derivative works of that mark.
 
 ## License
 
