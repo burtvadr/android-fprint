@@ -59,7 +59,14 @@ local `fprintd` sensor. GDM's existing fingerprint path (`gdm-fingerprint` +
 
 GNOME's screen lock uses the same `gdm-password` PAM service as the GDM password
 login (confirmed in the journal as `gdm-password`). That makes it the smallest
-end-to-end win and avoids touching `system-auth`:
+end-to-end win and avoids touching `system-auth`.
+
+The lock screen UI is part of GNOME Shell, not the GDM greeter, but
+authentication is routed through the `gdm-password` PAM service. GDM login has no
+active user session; the lock screen has one. Both reach the same PAM file, which
+is why one override covers both and why a mistake affects both. Other display
+managers/lock screens may use different service names (KDE has `kde` and
+`kde-fingerprint`).
 
 ```bash
 sudo ./packaging/arch/pam-gdm-phone.sh --dry-run
