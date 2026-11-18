@@ -78,6 +78,41 @@ started the session with a password, so screen unlock does not need a new keyrin
 password. A cold GDM login with phone-only authentication may still leave the
 login keyring locked; that is a separate problem.
 
+### Privilege, immutable systems and GDM
+
+Installing this integration is an **administrator action**, not a user action:
+
+- `/etc/pam.d`, the PAM module, the daemon and the systemd unit are system files.
+- PAM is loaded by system processes: `gdm-session-worker`, `sudo`, `polkit-agent-helper-1`.
+  A user cannot add a module to those stacks for their own account alone.
+- On an immutable/read-only-root distro, `/etc` is still administrator-controlled
+  (overlay, package layering, rpm-ostree, transactional update). The mechanism
+  changes; the privilege requirement does not.
+- An admin can install it once; daily pairing and use do not require root. The
+  user only needs access to the control socket (the `phone-auth` group).
+
+At the **GDM login screen there is no active user session**. The greeter runs as
+`gdm`; the user selects an account, and the system PAM stack authenticates that
+target account. This is why a system-wide integration can work there even though
+the user is not logged in — and why a purely per-user setup cannot.
+
+The GNOME **lock screen** is different: it runs inside the logged-in session and
+uses the same `gdm-password` PAM service, but the PAM configuration is still
+system-wide and admin-owned.
+
+Consequences:
+
+- Without administrator access, stock GNOME cannot be made to unlock this way.
+  That is a Linux/GDM architecture boundary, not a missing feature in this app.
+- Do not “fix” it with a GNOME Shell extension, `loginctl unlock-session`, or a
+  user-level agent that bypasses the lock screen. Those weaken the screen lock
+  and are not supported.
+- A future fprintd-compatible adapter is also a system service; it does not
+  remove the administrator requirement.
+- If you have no admin rights, use the password or a local fingerprint sensor.
+  `phone-authctl` can still authenticate a user-run command if the socket is
+  accessible, but it cannot change GDM, the lock screen or PAM.
+
 ### Scope
 
 - GDM password login.
@@ -1114,3 +1149,4 @@ These are separate adapters, not assumptions that the Linux code is portable.
 | 2026-11-18 | Syncthing is reference behavior only. Work is split into minimal V2/VPN fixes, optional upgrades, and ongoing robustness; no code, BEP, global discovery or relay is imported. |
 | 2026-11-18 | Current integration priority is GDM password login, `pkexec` and `systemctl` via polkit, using scoped `/etc/pam.d` overrides. Do not edit `system-auth` or `gdm-fingerprint` first. |
 | 2026-11-18 | Native GNOME/KDE fingerprint UI is a future fprintd-compatible virtual device, not a fake USB sensor. PAM integration comes first; the fprintd adapter waits for SEC-004 and a real packaging/security review. |
+| 2026-11-18 | GDM/lock-screen/PAM integration requires administrator install. There is no supported per-user or no-root path; immutable distros still require an admin transaction. The app cannot bypass the greeter or lock screen. |
