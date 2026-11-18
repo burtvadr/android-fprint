@@ -12,7 +12,7 @@ take precedence over feature work.
 | Host OS | **Linux only**. Tested on Arch Linux. Debian/Ubuntu PAM instructions exist; Fedora/BSD/macOS/Windows are not supported. |
 | Phone | **Android 9+** (`minSdk 28`), debug APK. Tested on a Motorola Edge 30 Ultra, API 37. No iOS app. |
 | Transport | **Wi-Fi** end to end. BLE framing/segmentation is tested; BlueZ/central wiring is not. |
-| Host integration | Linux-PAM; **sudo only** on the tested machine. Polkit/GDM/login/sshd are not wired by default. |
+| Host integration | Linux-PAM; **sudo works today**. Target: GDM password login plus `pkexec`/`systemctl` through polkit. See [Integration target](#integration-target-gnome-login-pkexec-and-systemctl). |
 | Service manager | systemd unit + Unix control socket. |
 | Build | Debug-signed APK; no release-signed/non-debuggable build. |
 | Protocol | Canonical CBOR, P-256 signatures, pinned TLS, pairing code, revocation tokens. |
@@ -44,6 +44,141 @@ Arch keeps vendor PAM files under `/usr/lib/pam.d`; local overrides belong in
 `/etc/pam.d`. Editing the vendor files is not durable. Adding the phone module to
 `system-auth` would affect many services at once and is deliberately not the
 default. Adding it to polkit or GDM must be tested with a root TTY available.
+
+## Integration target: GNOME login, pkexec and systemctl
+
+Current priority: make **GNOME login**, **pkexec** and **systemctl**
+authentication work with the phone's fingerprint, without turning the rest of the
+system into an accidental phone-only machine.
+
+“Fingerprint” here means the phone's biometric prompt through this app, not a
+local `fprintd` sensor. GDM's existing fingerprint path (`gdm-fingerprint` +
+`pam_fprintd`) is separate and must keep working.
+
+### Scope
+
+- GDM password login.
+- `pkexec` and `systemctl` actions that ask polkit for authentication.
+- `sudo` continues to work as it does now.
+- Password fallback must remain. If the phone is unavailable, cancelled or
+  times out, the normal password path continues.
+- Do **not** add the phone to `/etc/pam.d/system-auth`. That file is included by
+  GDM, polkit, login and sshd; editing it would change all of them at once.
+
+### Planned PAM layout
+
+Create local overrides by copying the vendor files and adding one line at the top
+of the `auth` stack:
+
+```text
+/etc/pam.d/gdm-password
+  auth  sufficient  pam_phone_auth.so  purpose=gdm  timeout_ms=15000
+  auth  include     system-local-login
+  ...
+
+/etc/pam.d/polkit-1
+  auth  sufficient  pam_phone_auth.so  purpose=polkit  timeout_ms=15000
+  auth  include     system-auth
+  ...
+```
+
+The rest of each vendor file remains unchanged.
+
+Do not put the phone in `gdm-fingerprint` initially. That stack is owned by
+`pam_fprintd` and is only entered when GDM selects the local fingerprint method.
+The first target is the password form: the user submits the form, PAM reaches the
+phone module, and the phone prompt appears. A separate “phone” authentication
+method in the GDM UI is a later experiment, not part of this change.
+
+### Process identity is part of the integration
+
+`sudo` works because PAM runs as root. GDM and polkit are different:
+
+- `gdm-session-worker` runs as root, so the existing control-socket access and
+  `authorize_caller` behavior should work, but this must be verified on the live
+  greeter.
+- `polkitd` runs as `polkitd`. PAM may execute inside polkitd, which means:
+  - it needs access to `/run/phone-authd/control.sock` (group membership or a
+    narrow ACL), and
+  - `authorize_caller` currently allows root or the caller's own account only.
+    A request from `polkitd` for the target desktop account would be refused.
+
+The fix is not “allow polkitd to ask for anyone”. It is an explicit trusted
+integration policy: named service UIDs (`root`, `gdm`, `polkitd`) may request
+authentication for the target account only when the configured PAM service and
+operation match. This is part of SEC-004, not a separate bypass.
+
+If polkit's PAM runs as root on this Arch version, the immediate work is only
+group/socket testing. If it runs as polkitd, the trusted-service policy is a
+prerequisite.
+
+### Prompt quality
+
+The phone prompt must show enough to make a correct decision:
+
+- the target Linux account;
+- the PAM service/purpose (`gdm`, `polkit`, `sudo`);
+- the operation (login, polkit action, sudo);
+- the approving device and its owner once SEC-004 exists.
+
+The prompt must not show an unsigned display name as the host identity. Account
+and operation come from the signed request context.
+
+### Safety and rollback
+
+- Keep a root TTY open for every PAM experiment.
+- Back up each file separately:
+  `gdm-password.bak.<timestamp>`, `polkit-1.bak.<timestamp>`.
+- Change one stack at a time.
+- Test with the phone offline, with the phone cancelling, and with a wrong
+  password typed into the GDM/polkit dialog.
+- Keep `sufficient`: password must remain available.
+- Remove `debug` from the installed line; it is troubleshooting-only.
+
+### Test matrix
+
+- GDM password login with the phone present.
+- GDM password login with the phone absent → password still works.
+- GDM login when the phone cancels → password still works.
+- Local `fprintd` fingerprint login still works.
+- `pkexec` allowed action with phone; denied/cancelled action with password.
+- `systemctl` action that triggers polkit with phone; cancel/timeout.
+- `sudo` still works.
+- `ssh` password/key login is unchanged.
+- `su` is unchanged.
+- Reboot after each PAM change to prove the greeter is not broken.
+
+### Security caveat
+
+Until SEC-004 ownership and account policy lands, the phone is still host-wide.
+That is acceptable for a single-user pilot with an explicit warning, but not for
+a multi-user machine. Polkit actions can target root; enabling them makes
+`allow_root`/ownership urgent.
+
+### SEC-004 implementation sequence
+
+The corrected plan, in the order it should be built:
+
+1. **Ownership** — add `{ uid, name }` to each device record; non-root pairing
+   defaults to the initiator; root pairing requires `--owner`; root owner is
+   rejected initially. Legacy paired records become unassigned/deny-all, while
+   revoked records stay revoked.
+2. **Enforcement** — `self` scope only; target UID must equal owner UID; root is
+   always denied; delegation is denied; policy is checked before a challenge is
+   generated or sent to the phone.
+3. **Administration** — `selected` accounts, `allow_root` for target UID 0,
+   `allow_elevated`, canonical operation mapping, admin CLI and audit of
+   approver + target.
+4. **Phone and protocol** — advertise policy in `PAIRING_RESULT` or a signed
+   policy message; show the target account/operation; test migration.
+
+Two corrections matter:
+
+- Store both UID and name and require the current mapping to match. UIDs can be
+  recycled and names can be renamed; UID-only or name-only is not enough.
+- Operation policy must use a canonical operation derived from trusted,
+  root-owned PAM configuration. Raw `operation` strings from IPC are not a
+  security boundary.
 
 ## Known network issue: VPN / Tailscale
 
@@ -776,6 +911,10 @@ Do these before expanding the platform surface:
 
 ### Phase 1 — Linux production integration
 
+- [ ] Ship the GDM/polkit integration described in
+      [Integration target](#integration-target-gnome-login-pkexec-and-systemctl):
+      scoped `/etc/pam.d/gdm-password` and `/etc/pam.d/polkit-1` overrides,
+      verified process identity, prompt context and the full test matrix.
 - [ ] Implement the adb-like pairing and device UX described in
       [CLI and pairing UX](#cli-and-pairing-ux): one code line, no default
       confirmation prompt, truthful completion, `devices --json`, `unpair`.
@@ -884,3 +1023,4 @@ These are separate adapters, not assumptions that the Linux code is portable.
 | 2026-11-18 | Do not vendor or port Syncthing code. Reimplement the multi-path/retry behavior from documented concepts; Syncthing is MPL-2.0 and this tree is 0BSD. |
 | 2026-11-18 | A relay/rendezvous fallback is optional. Prefer Tailscale/WireGuard/SSH or a minimal protocol-specific relay over adopting Syncthing's relay stack. |
 | 2026-11-18 | Syncthing is reference behavior only. Work is split into minimal V2/VPN fixes, optional upgrades, and ongoing robustness; no code, BEP, global discovery or relay is imported. |
+| 2026-11-18 | Current integration priority is GDM password login, `pkexec` and `systemctl` via polkit, using scoped `/etc/pam.d` overrides. Do not edit `system-auth` or `gdm-fingerprint` first. |
