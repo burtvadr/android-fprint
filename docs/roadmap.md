@@ -147,6 +147,69 @@ Acceptance criteria:
 - [ ] Tests cover VPN on/off on the phone and Tailscale up on the host; address
       choice remains a routing decision, not an authentication decision.
 
+## Syncthing as reference code
+
+Syncthing is a **reference for behavior, not a dependency and not a source to
+vendor**. It is MPL-2.0; this tree is 0BSD. No Syncthing code is copied. The
+notes below describe what to reimplement independently, split into what is needed
+now, what is an upgrade, and what is ongoing robustness work.
+
+### Minimal — needed to fix VPN/Tailscale
+
+These are the pieces required for the current LAN + Tailscale setup:
+
+- Collect **all** resolved host addresses, not a single `NsdServiceInfo.host`.
+- Classify each address as LAN or non-LAN/VPN. Prefer LAN, but keep the VPN
+  address as a candidate; do not blacklist Tailscale by name.
+- Try candidates with a short per-address timeout instead of one attempt.
+- Retry and re-resolve periodically, and reconnect when Wi-Fi/VPN changes.
+- Bind the Android data socket to the chosen `Network`; do not rely on the
+  default route while a VPN is active.
+- Let the host advertise only intended interfaces, or add explicit
+  `--advertise-address` / `--mdns-interface` controls.
+- Log the chosen address, network and failure reason.
+- Keep TLS pinning and the signed protocol transcript unchanged. Path selection
+  is routing, not authentication.
+
+### Upgrade — useful, not blocking
+
+These improve resilience but are not required for the first fix:
+
+- Parallel dialing within a priority bucket, first usable connection wins.
+- Multiple simultaneous connections with priority upgrade/downgrade.
+- QUIC/UDP as a second transport alongside TCP/TLS.
+- Dialing with and without a reused local port to work around routing quirks.
+- Optional relay or rendezvous fallback, preferably an existing transport
+  (Tailscale, WireGuard, SSH) or a minimal protocol-specific relay.
+- Richer discovery: multiple A/AAAA records, explicit LAN/WAN metadata,
+  IPv6-first or IPv4-first policy.
+- User-visible path preference and connection status.
+
+Syncthing's relay, global discovery, NAT traversal and BEP protocol are **not**
+being adopted. They solve a different problem and are too large for this project.
+
+### Robustness — ongoing quality bar
+
+These are properties every implementation must keep, even in the minimal version:
+
+- Enumerate interfaces fresh on each cycle; do not cache stale interfaces.
+- Expire discovery results and retry failed addresses later.
+- Bound every attempt with a timeout and the whole cycle with a budget.
+- Handle IPv4/IPv6, link-local, loopback and duplicate addresses.
+- On Android, skip cellular point-to-point interfaces for local broadcast and
+  never assume cellular is a viable local path.
+- Isolate one bad address or interface: it must not stop the retry loop.
+- Avoid tight reconnect loops; use backoff and respect Doze/battery limits.
+- Log attempts, chosen path and failover reason; expose them in
+  `phone-authctl status`/`devices`.
+- Test VPN on/off, Wi-Fi changes, LAN-only, Tailscale-only, no route, and
+  dual-stack hosts.
+- Never let an address choice bypass certificate pinning, signature checks or
+  policy enforcement.
+
+The minimal set is the next transport task. The upgrade items stay on the
+roadmap; the robustness rules apply from the first implementation.
+
 ## What "supported" means
 
 A platform is supported only when it has:
@@ -820,3 +883,4 @@ These are separate adapters, not assumptions that the Linux code is portable.
 | 2026-11-18 | macOS/BSD/iOS are separate adapters with their own threat models; Windows is out of scope. |
 | 2026-11-18 | Do not vendor or port Syncthing code. Reimplement the multi-path/retry behavior from documented concepts; Syncthing is MPL-2.0 and this tree is 0BSD. |
 | 2026-11-18 | A relay/rendezvous fallback is optional. Prefer Tailscale/WireGuard/SSH or a minimal protocol-specific relay over adopting Syncthing's relay stack. |
+| 2026-11-18 | Syncthing is reference behavior only. Work is split into minimal V2/VPN fixes, optional upgrades, and ongoing robustness; no code, BEP, global discovery or relay is imported. |
