@@ -132,6 +132,122 @@ CAPABILITIES {
 The host and device should exchange this once per session, cache only
 non-sensitive summaries, and renegotiate when either side changes policy.
 
+## Security options and policy layers
+
+The proposed Settings → **Security options** section is the right place for
+device-side consent, but it must not become the host's authorization policy. Use
+three independent layers.
+
+| Layer | Stored where | Who may change it | What it can do |
+|---|---|---|---|
+| Device consent | Android app-private settings | The phone user, gated by biometric/app lock if enabled | Narrow which negotiated operations/factors the phone will accept |
+| Per-user host policy | Per-UID daemon state or `$XDG_CONFIG_HOME/phone-auth/policy.json`, mode `0600` | The same Linux user through the local control socket (`SO_PEERCRED`) | Allow/narrow operations for that user's own account |
+| Global host policy | `/etc/phone-auth/policy.json`, root-owned `0600` | root only | Device-to-user binding, root/privileged operations, machine-wide integrations |
+| Integration installation | PAM/polkit/GDM files, systemd unit, socket ownership | root only | Makes the mechanism available at all |
+
+### Device-side Security options
+
+Suggested toggles, all of which can only **narrow** host policy:
+
+- **Require biometric to open Settings** (or to open the app manually).
+- **Require biometric to change security options / unpair a host.**
+- Per-host operation toggles, populated from capability negotiation:
+  `sudo`, `su`, `polkit`, `systemctl`/`org.freedesktop.systemd1.manage-units`,
+  `login`, `gdm`, `sshd`, `screen-unlock`, future actions.
+- Per-transport toggles where meaningful: Wi-Fi, BLE.
+
+The app lock is a local UX/consent gate, not a cryptographic boundary. The real
+authentication control remains the `BIOMETRIC_STRONG` signature prompt. An
+auto-opened request must **not** require a second app-unlock first: the system
+biometric prompt is already the authentication. Use the app lock for manual
+launch/settings/unpair, not for the transparent request prompt.
+
+Store these settings in app-private `DataStore`/preferences with backup disabled.
+They contain no secrets, but their integrity matters. A Keystore HMAC can detect
+casual tampering; it cannot protect against a rooted or compromised OS.
+
+### Host-side settings
+
+The PC does not need `sudo` to change a user's own policy if the daemon enforces
+peer identity:
+
+- A local client connects to the root/`phone-auth` control socket.
+- The daemon reads `SO_PEERCRED` and only permits that UID to change its own
+  policy.
+- Per-user policy is stored atomically with mode `0600` and audited.
+- root-only settings cover global enablement, device-to-user binding, root
+  operations, and integration installation.
+
+Do not use one world-writable policy file. It turns "settings" into a privilege
+escalation surface. Do not let an unprivileged user enable a global integration
+or bind their device to another Linux account.
+
+### Installation versus runtime policy
+
+Installing a PAM/polkit/GDM line requires root. That is expected and separate
+from the toggle:
+
+- **Installed but disabled:** the module is present, returns unavailable/ignore,
+  and the normal password path continues.
+- **Installed and enabled:** the phone may be asked for the operations allowed by
+  both host policy and phone consent.
+- **Not installed:** the phone cannot authenticate that service, regardless of
+  app toggles.
+
+Use `sufficient`, not `required`, for the phone line unless the operator
+explicitly wants a phone-or-lockout policy. Keep an integration-specific rollback
+file and a root TTY while changing PAM.
+
+### Disable, mask, or uninstall?
+
+"Masking" is systemd terminology for units; PAM has no equivalent. Once an
+integration is installed, prefer disabling it through policy rather than editing
+PAM files again:
+
+| State | What it means | Root needed? | Effect |
+|---|---|---|---|
+| Installed + enabled | PAM/polkit/GDM line is present and policy allows the action | Installation: yes. Runtime change: no for the user's own policy | Phone may authenticate this action |
+| Installed + disabled | Line is present, but host policy or phone consent disables the action | No | Module returns unavailable/ignore; normal password path continues |
+| Daemon stopped/masked | `phone-authd` is not running; PAM line remains | Yes for systemd mask/stop | Module cannot reach the daemon; password path continues |
+| Uninstalled | `/etc/pam.d` override and, if desired, the module/package are removed | Yes | The integration no longer exists |
+
+Runtime policy should be the normal switch. It is reversible, auditable, and does
+not risk a broken PAM stack. Uninstall is for cleaning the machine, not for daily
+toggling.
+
+The phone can hide or grey out an action the host marks disabled; that is only a
+UI hint. The host must enforce the same decision, and the phone must still refuse
+an unexpected request for a disabled action.
+
+Recommendations for implementation:
+
+- Track `installed` (packaging/manifest) separately from `enabled` (policy).
+  Do not infer installation by parsing PAM files at runtime.
+- Add a `phone-authctl integrations` view showing installed, available, enabled
+  and disabled actions.
+- Let a user disable their own actions without root; require root for global
+  actions or device-to-user binding changes.
+- Keep a documented uninstall/rollback procedure that restores the original
+  `/etc/pam.d` override from the backup created during installation.
+
+### Capability IDs, not generic labels
+
+A toggle for "systemctl" is too broad. Negotiate the actual action identifiers,
+for example:
+
+- `auth.sudo`
+- `auth.su`
+- `org.freedesktop.policykit.exec`
+- `org.freedesktop.systemd1.manage-units`
+- `login.gdm`
+- `login.console`
+- `login.sshd`
+- `unlock.screen`
+
+The phone displays only actions the host advertises, and the host still enforces
+its own policy. A stale toggle for an action the host no longer advertises is
+ignored, not treated as consent.
+
 ## Roadmap phases
 
 ### Phase 0 — Security remediation
