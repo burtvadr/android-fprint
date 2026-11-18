@@ -259,11 +259,42 @@ Recommended model:
 - A user who wants an independent trust relationship should pair their own phone
   (a separate device record), not reuse another user's phone silently.
 
+Account scope is a policy dimension, not a new host identity. Support all of these
+without duplicating `host_id`:
+
+| Scope | Pairing | Who authorises | App shows |
+|---|---|---|---|
+| `self` (default) | The pairing user only | User + host operator | `archlinux` / `desktop` |
+| `selected` | A list of accounts | Host admin/root, phone confirms the list | `archlinux` / `desktop, alice` |
+| `all` | Every normal account, **excluding root** | root, explicit warning | `archlinux` / all accounts |
+| `all+root` | Every account including root | root, separate explicit flag | strong root warning |
+| Per-user device | One phone/key per user | That user pairs independently | separate device records |
+
+The recommended defaults are `self` and a separate phone per user when independent
+compromise domains are wanted. `selected` and `all` are convenience modes for a
+shared phone; they do not change the device key. `all+root` should be treated as a
+deliberate, strongly discouraged policy.
+
 If the phone must enforce the allow-list locally, the host needs to advertise it:
 a `PAIRING_RESULT` account list, a capability/policy message after pairing, or a
 signed `SESSION_HELLO` extension. The host policy remains authoritative even if
-the phone list is stale. This is a protocol addition, not a reason to create a
-host key per user.
+the phone list is stale. A sensible wire shape is:
+
+```text
+account_scope: "self" | "selected" | "all"
+accounts: ["desktop", "alice"]   // only for selected
+allow_root: false                // separate, default false
+```
+
+The scope and accounts must be bound to the pairing transcript or a signed policy
+message; the device displays the final scope and the host enforces it. Expanding
+the scope later should require host authorisation and, ideally, a fresh phone
+confirmation. Shrinking the scope can be host-side.
+
+A shared device key across accounts means a compromised phone can approve any
+account in its scope. Per-account toggles are consent filters, not separate
+security domains. Users who need independent compromise domains should pair
+separate phones/keys.
 
 Do not model this as `host_id = archlinux/alice`. That would duplicate host
 identity and TLS pins per account and make the machine look like many hosts.
@@ -330,6 +361,8 @@ Do these before expanding the platform surface:
 - [ ] Add downgrade/mismatch tests and a "required capability missing" failure.
 - [ ] Add shared vectors and a conformance run for the new messages.
 - [ ] Keep capabilities separate from authorization; document the distinction.
+- [ ] Add `account_scope`/`accounts`/`allow_root` to pairing or policy exchange,
+      with scope expansion requiring host authorization and phone confirmation.
 
 ### Phase 3 — Portability
 
