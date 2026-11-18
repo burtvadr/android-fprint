@@ -24,6 +24,13 @@ use crate::config::Config;
 use crate::engine::Engine;
 use crate::tls;
 
+/// Maximum simultaneous Wi-Fi connections, including ones still in the TLS
+/// handshake. A phone uses one connection; the rest is headroom for reconnects.
+const MAX_WIFI_CONNECTIONS: usize = 64;
+
+/// Time allowed for the TLS handshake before the connection is dropped.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Advertises the host over DNS-SD so devices can find it without a fixed
 /// address. Publication contains only non-secret metadata (`PROTOCOL.md` §13.1).
 pub fn advertise(
@@ -129,6 +136,7 @@ pub async fn serve(
         .await
         .map_err(|e| ProtocolError::Internal(format!("bind {}: {e}", config.bind_addr)))?;
     let pairing_timeout = android_fprint_protocol::types::PAIRING_TTL;
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_WIFI_CONNECTIONS));
 
     loop {
         tokio::select! {
@@ -142,12 +150,24 @@ pub async fn serve(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                let permit = match Arc::clone(&slots).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    // No slot: drop the socket. This bounds descriptors, memory
+                    // and tasks even under a stalled-connection flood.
+                    Err(_) => continue,
+                };
                 let tls_cfg = tls_config.clone();
                 let engine = engine.clone();
                 let shutdown = shutdown.clone();
                 tokio::spawn(async move {
-                    match tls::accept(stream, tls_cfg).await {
-                        Ok(tls_stream) => {
+                    let _permit = permit;
+                    let handshake = tokio::time::timeout(
+                        TLS_HANDSHAKE_TIMEOUT,
+                        tls::accept(stream, tls_cfg),
+                    )
+                    .await;
+                    match handshake {
+                        Ok(Ok(tls_stream)) => {
                             let peer_label = peer.to_string();
                             let conn = crate::transport::open(engine.clone(), tls_stream, Transport::Wifi, peer_label);
                             if let Err(e) = conn.run(pairing_timeout).await {
@@ -157,10 +177,14 @@ pub async fn serve(
                                 engine.audit().write(&ev);
                             }
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             // A failed TLS handshake is not an authentication
                             // event; it may just be an unrelated scanner.
                             let _ = e;
+                        }
+                        Err(_) => {
+                            // Handshake deadline hit; the stream is dropped with
+                            // the future.
                         }
                     }
                     let _ = shutdown;

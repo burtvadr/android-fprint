@@ -20,6 +20,14 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::engine::Engine;
 use android_fprint_protocol::pairing::PairingResult;
 
+/// Time allowed for the peer to send `SESSION_HELLO_ACK`.
+const SESSION_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Idle limit between frames. Authentication may legitimately wait for a human
+/// fingerprint and confirmation, so this is longer than the default auth timeout
+/// but still bounds a stalled connection.
+const FRAME_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// One accepted device connection.
 ///
 /// Generic over the byte stream so the Wi-Fi (TLS) and BLE (GATT) adapters share
@@ -94,9 +102,11 @@ where
         let _ = self.send(&hello_frame).await;
 
         // 2. The peer must answer with SESSION_HELLO_ACK.
-        let first = match self.read_message().await? {
-            Some(m) => m,
-            None => return Ok(()),
+        let first = match tokio::time::timeout(SESSION_SETUP_TIMEOUT, self.read_message()).await {
+            Ok(Ok(Some(m))) => m,
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Ok(()),
         };
         let ack = match first {
             Message::SessionHelloAck(a) => a,
@@ -185,11 +195,12 @@ where
                         }
                     }
                 }
-                frame = self.reader.next_frame() => {
+                frame = tokio::time::timeout(FRAME_READ_TIMEOUT, self.reader.next_frame()) => {
                     match frame {
-                        Err(_) => break,   // fail closed on any framing error
-                        Ok(None) => break,  // clean disconnect
-                        Ok(Some(f)) => {
+                        Err(_) => break,   // stalled connection: fail closed
+                        Ok(Err(_)) => break,   // fail closed on any framing error
+                        Ok(Ok(None)) => break,  // clean disconnect
+                        Ok(Ok(Some(f))) => {
                             match Message::from_frame(&f) {
                                 // A pairing submission is routed without needing a
                                 // registered device identity.

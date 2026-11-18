@@ -1134,8 +1134,7 @@ private fun OperatorContent(
         }
         when (state) {
             is SessionState.AwaitingApproval -> RequestPanel(state, waitingForBiometric = false)
-            is SessionState.AwaitingBiometric ->
-                RequestPanel(state.request, waitingForBiometric = true)
+            is SessionState.AwaitingBiometric -> RequestPanel(state, waitingForBiometric = true)
             is SessionState.PairingAwaitingCode -> PairingWaitingPanel(state.hostName)
             is SessionState.PairingAwaitingHostCode -> PairingHostCodePanel(
                 hostName = state.hostName,
@@ -1166,12 +1165,29 @@ private fun OperatorContent(
 
 @Composable
 private fun RequestPanel(state: SessionState.AwaitingApproval, waitingForBiometric: Boolean) {
-    RequestPanel(state.request, waitingForBiometric)
+    RequestPanel(
+        request = state.request,
+        hostName = state.hostName,
+        hostKeyId = state.hostKeyId,
+        waitingForBiometric = waitingForBiometric,
+    )
+}
+
+@Composable
+private fun RequestPanel(state: SessionState.AwaitingBiometric, waitingForBiometric: Boolean) {
+    RequestPanel(
+        request = state.request,
+        hostName = state.hostName,
+        hostKeyId = state.hostKeyId,
+        waitingForBiometric = waitingForBiometric,
+    )
 }
 
 @Composable
 private fun RequestPanel(
     request: com.androidfprint.protocol.AuthRequest,
+    hostName: String,
+    hostKeyId: String,
     waitingForBiometric: Boolean,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -1188,14 +1204,18 @@ private fun RequestPanel(
                 modifier = Modifier.padding(20.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                Field("Host", request.displayHostName ?: request.hostId.toHex())
+                Field("Host", hostName)
+                Field("Host key", hostKeyId.take(16))
                 Field("User", request.username)
-                Field("Action", request.purpose)
-                if (request.service != request.purpose) Field("Service", request.service)
+                Field("Service", request.service)
                 Field("Operation", request.operation)
+                Field("Action", request.purpose)
             }
         }
 
+        // The display name and detail are advisory fields: they are not covered
+        // by the device signature. Show them separately, never as the host's
+        // identity, and prefer the locally stored paired name above.
         request.displayDetail?.let { detail ->
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -1216,7 +1236,7 @@ private fun RequestPanel(
                     Spacer(Modifier.width(10.dp))
                     Column {
                         Text(
-                            "Unverified detail from Linux (not covered by the signature)",
+                            "Unverified detail from the host (not covered by the signature)",
                             style = MaterialTheme.typography.labelMedium,
                         )
                         Text(detail, style = MaterialTheme.typography.bodyMedium)
@@ -1439,8 +1459,8 @@ private fun PairingCodeEntryPanel(
 private fun ApprovedPanel(state: SessionState.Approved) {
     ResultCard(
         title = "Authenticated",
-        body = "Signed for ${state.request.username} on " +
-            "${state.request.displayHostName ?: "this host"}.",
+        body = "Signed for ${state.request.username} on ${state.hostName} " +
+            "(${state.hostKeyId.take(16)}).",
         icon = Icons.Outlined.CheckCircle,
         container = MaterialTheme.colorScheme.primaryContainer,
         content = MaterialTheme.colorScheme.onPrimaryContainer,

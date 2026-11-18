@@ -83,14 +83,31 @@ sealed interface SessionState {
 
     data class PairingConfirmed(val hostName: String) : SessionState
 
-    /** A request is on screen, waiting for the operator. */
-    data class AwaitingApproval(val request: AuthRequest) : SessionState
+    /**
+     * A request is on screen, waiting for the operator.
+     *
+     * [hostName] and [hostKeyId] come from the locally stored paired-host record
+     * and the signed host id, not from the unsigned display label in the request.
+     */
+    data class AwaitingApproval(
+        val request: AuthRequest,
+        val hostName: String,
+        val hostKeyId: String,
+    ) : SessionState
 
     /** A biometric prompt is in front of the operator. */
-    data class AwaitingBiometric(val request: AuthRequest) : SessionState
+    data class AwaitingBiometric(
+        val request: AuthRequest,
+        val hostName: String,
+        val hostKeyId: String,
+    ) : SessionState
 
     /** Signed and sent. */
-    data class Approved(val request: AuthRequest) : SessionState
+    data class Approved(
+        val request: AuthRequest,
+        val hostName: String,
+        val hostKeyId: String,
+    ) : SessionState
 
     /** Denied, with the reason shown to the operator. */
     data class Denied(val requestId: String, val reason: String) : SessionState
@@ -434,10 +451,11 @@ class AuthenticatorSession(
     /**
      * Completes the device half of pairing.
      *
-     * The code is derived from both nonces, so it can only be computed here, after
-     * the host's nonce has arrived. The selected `code_entry` mode decides which
-     * endpoint displays it; nothing is persisted until the reciprocal MAC verifies
-     * and the human gate is satisfied.
+     * The code is derived from an ephemeral ECDH secret bound to the full
+     * transcript, so it can only be computed after the host's ephemeral key has
+     * arrived. The selected `code_entry` mode decides which endpoint displays it;
+     * nothing is persisted until the reciprocal MAC verifies and the human gate is
+     * satisfied.
      *
      * @param hostName the operator-visible host label, when discovery supplied one.
      */
@@ -469,8 +487,25 @@ class AuthenticatorSession(
             val deviceNonce = ByteArray(Limits.CHALLENGE_LEN).also {
                 java.security.SecureRandom().nextBytes(it)
             }
-            val session = PairingSession(start.sessionId, start.hostNonce)
-            session.deriveWithDeviceNonce(deviceNonce)
+            val publicKeyBytes = key.publicKeyBytes()
+                ?: return fail("the device key is unavailable; re-enrolment may have invalidated it")
+            val devicePublicKeyId = Hex.encode(sha256(publicKeyBytes))
+
+            // The code is derived from an ephemeral ECDH secret bound to the full
+            // transcript, including both long-term public keys. A substituted key
+            // therefore produces a different code on each endpoint.
+            val session = PairingSession(
+                start.sessionId,
+                start.hostNonce,
+                start.hostEphPublicKey,
+            )
+            session.derive(
+                start.hostId,
+                deviceId,
+                start.hostPublicKey,
+                publicKeyBytes,
+                deviceNonce,
+            )
 
             val code = session.code()
             // When the operator pre-selected a code, both sides must derive the same
@@ -478,10 +513,6 @@ class AuthenticatorSession(
             if (start.code.isNotEmpty() && start.code != code) {
                 return fail("the code derived by this phone does not match the chosen code")
             }
-
-            val publicKeyBytes = key.publicKeyBytes()
-                ?: return fail("the device key is unavailable; re-enrolment may have invalidated it")
-            val devicePublicKeyId = Hex.encode(sha256(publicKeyBytes))
 
             val mac = session.deviceMac(
                 start.hostId, deviceId, start.hostPublicKey, publicKeyBytes,
@@ -493,6 +524,7 @@ class AuthenticatorSession(
                 devicePublicKey = publicKeyBytes,
                 deviceKeyId = devicePublicKeyId,
                 deviceNonce = deviceNonce,
+                deviceEphPublicKey = session.deviceEphemeralPublicKey,
                 mac = mac,
                 cleanupTokens = pendingRevocations.tokens(start.hostId),
             )
@@ -720,7 +752,11 @@ class AuthenticatorSession(
         promptTimes.addLast(nowMillis)
 
         pendingRequest = request
-        _state.value = SessionState.AwaitingApproval(request)
+        _state.value = SessionState.AwaitingApproval(
+            request,
+            trustedHostName(request.hostId),
+            request.hostId.toHex(),
+        )
     }
 
     /**
@@ -764,7 +800,11 @@ class AuthenticatorSession(
 
         // The operator's approval is bound to this exact request id.
         approvedRequestId = request.requestId.toHex()
-        _state.value = SessionState.AwaitingBiometric(request)
+        _state.value = SessionState.AwaitingBiometric(
+            request,
+            trustedHostName(request.hostId),
+            request.hostId.toHex(),
+        )
 
         return authenticateStrong(
             activity = activity,
@@ -906,15 +946,29 @@ class AuthenticatorSession(
         send(Message.AuthResponseMessage(response).toFrame())
         approvedRequestId = null
         pendingRequest = null
-        _state.value = SessionState.Approved(request)
+        _state.value = SessionState.Approved(
+            request,
+            trustedHostName(request.hostId),
+            request.hostId.toHex(),
+        )
     }
+
+    /**
+     * The locally stored label for a paired host. The `display_host_name` field in
+     * the request is unsigned and must never be the primary identity shown to the
+     * operator; it is presented separately as unverified metadata.
+     */
+    private fun trustedHostName(hostId: Id): String =
+        hosts.get(hostId)?.hostName?.takeIf { it.isNotBlank() }
+            ?: "Unknown host"
 
     /** Human-readable summary of exactly what is being authorised. */
     private fun describe(request: AuthRequest): String = buildString {
-        append("Host: ${request.displayHostName ?: request.hostId.toHex()}\n")
+        append("Host: ${trustedHostName(request.hostId)} (${request.hostId.toHex().take(16)})\n")
         append("User: ${request.username}\n")
+        append("Service: ${request.service}\n")
+        append("Operation: ${request.operation}\n")
         append("Action: ${request.purpose}")
-        if (request.service != request.purpose) append(" (${request.service})")
     }
 
     private fun fail(message: String): SessionState {

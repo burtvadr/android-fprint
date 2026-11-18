@@ -372,10 +372,19 @@ where
         }
 
         let device_nonce: [u8; CHALLENGE_LEN] = crypto::random_array()?;
-        let mut session = PairingSession::new(start.session_id, start.host_nonce);
-        session.derive_with_device_nonce(device_nonce)?;
+        let session = PairingSession::new_device(
+            start.session_id,
+            start.host_nonce,
+            start.host_eph_pubkey,
+            &start.host_id,
+            &start.host_pubkey,
+            &self.device.device_id,
+            &self.device.public_key(),
+            device_nonce,
+        )?;
 
-        // Both screens show a code derived from the same two nonces.
+        // Both screens show a code derived from the same ephemeral ECDH secret
+        // and full transcript, including both long-term public keys.
         let code = session.code()?;
         if !start.code.is_empty() && start.code != code {
             // The operator pre-selected a code and the device disagrees, so the
@@ -406,6 +415,9 @@ where
             device_pubkey: self.device.public_key(),
             device_key_id: self.device.key_id_hex(),
             device_nonce,
+            device_eph_pubkey: session
+                .device_eph_public
+                .ok_or_else(|| ProtocolError::Internal("device ephemeral key missing".into()))?,
             mac,
             cleanup_tokens: Vec::new(),
         };

@@ -47,13 +47,21 @@ class MessagesTest {
     fun `pairing code uses more than one byte`() {
         // The old implementation used p[0] % 1_000_000, which can only produce
         // 000000..000255. At least one deterministic session must escape it.
+        val hostEph = encodeEcpPublicKey(
+            generateP256KeyPair().public as java.security.interfaces.ECPublicKey,
+        )
         for (i in 0 until 64) {
             val session = PairingSession(
                 Id(ByteArray(Limits.ID_LEN) { i.toByte() }),
                 ByteArray(Limits.CHALLENGE_LEN) { i.toByte() },
+                hostEph,
             )
-            session.deriveWithDeviceNonce(
-                ByteArray(Limits.CHALLENGE_LEN) { (i + 1).toByte() },
+            session.derive(
+                hostId = Id(ByteArray(Limits.ID_LEN) { (i + 2).toByte() }),
+                deviceId = Id(ByteArray(Limits.ID_LEN) { (i + 3).toByte() }),
+                hostPub = ByteArray(Limits.PUBKEY_LEN) { (i + 4).toByte() },
+                devicePub = ByteArray(Limits.PUBKEY_LEN) { (i + 5).toByte() },
+                deviceNonce = ByteArray(Limits.CHALLENGE_LEN) { (i + 1).toByte() },
             )
             if (session.code().toInt() > 255) return
         }

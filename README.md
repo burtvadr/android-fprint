@@ -41,12 +41,12 @@ Authenticated.
 | Component | State |
 |---|---|
 | Protocol specification | complete, normative |
-| Rust implementation | complete, 194 tests |
+| Rust implementation | complete, 198 tests |
 | Kotlin implementation | complete, 124 cross-language conformance checks |
 | `phone-authd` | working end to end: pairing, challenge/response, verification, revocation |
 | `phone-authctl` | working |
 | `phone-auth-sim` | working, including deliberate misbehaviour for tests |
-| `pam_phone_auth` | **one line in `common-auth` authenticates every password prompt on the system** — polkit dialog, screen unlock, sudo, login, `su` (`make verify-all-auth`) |
+| `pam_phone_auth` | one line in the PAM stack you choose; scope it to `sudo`, polkit or login deliberately (`make verify-all-auth`) |
 | Android app | validated on a Motorola Edge 30 Ultra: Wi-Fi discovery, both pairing code directions, background auto-prompt, biometric-gated signing, auto-close after the decision |
 | polkit agent | **unnecessary** — see below. Kept for headless hosts only |
 | BLE transport | framing and segmentation complete and tested; BlueZ/central wiring not done |
@@ -63,7 +63,7 @@ make verify       # everything above (Rust + Kotlin vectors + end to end)
 make android-all  # Android lint, unit tests, debug APK (needs ANDROID_HOME)
 ```
 
-Latest run: 194 Rust tests pass with no clippy warnings; the Kotlin runner agrees
+Latest run: 198 Rust tests pass with no clippy warnings; the Kotlin runner agrees
 with Rust on 124 checks; the end-to-end smoke test passes; the Android app lints
 clean, passes 31 unit tests, builds a debug APK, and has been exercised end to end
 on a physical phone in the foreground and in the background.
@@ -94,8 +94,12 @@ on a physical phone in the foreground and in the background.
   is used changes at most the freshness window.
 
 Known limitations are listed in [`docs/threat-model.md`](docs/threat-model.md),
-including the one that matters most: the pairing code is a keyed integrity check,
-not a PAKE, so it is not forward-secret against a later device-key compromise.
+including the one that matters most: the pairing code is a six-digit short
+authentication string over an ephemeral ECDH transcript, not a PAKE. A key
+substitution changes the derived code on each endpoint, but an active attacker
+still has about a `2^20` window per live, single-use pairing session. Both
+ephemeral private keys are discarded, so a recorded transcript does not reveal
+the pairing secret to a later key compromise.
 
 ## Repository layout
 
@@ -228,66 +232,80 @@ pass the same paths to `phone-authctl`.
 
 ## Installing PAM integration
 
-One line, in one file, covers every password prompt on the system.
+PAM configuration is distro-specific. Install one line in the stack you actually
+want the phone to satisfy; there is no portable "one file" that is correct
+everywhere.
+
+| Distro | Typical file | Scope |
+|---|---|---|
+| Arch | `/etc/pam.d/sudo` | `sudo` only. polkit uses `system-auth`; GDM uses `gdm-password`. |
+| Debian/Ubuntu | `/etc/pam.d/common-auth` | Included by many services; broad scope. |
+| Fedora | `/etc/pam.d/system-auth` / `password-auth` | Broad scope. |
+
+The Arch example is the recommended starting point because it does not silently
+change polkit or the login screen:
 
 ```bash
-sudo cp /etc/pam.d/common-auth /etc/pam.d/common-auth.bak
-sudoedit /etc/pam.d/common-auth
+sudo cp /etc/pam.d/sudo /etc/pam.d/sudo.bak
+sudoedit /etc/pam.d/sudo
 ```
 
 ```text
-auth  sufficient  pam_phone_auth.so  purpose=auth debug
+auth  sufficient  pam_phone_auth.so  purpose=sudo
 ```
 
-Put it **before** the `pam_unix` line — the place `pam-auth-update`'s own comment in
-that file recommends for a local module.
+Put it before the `pam_unix.so`/`system-auth` line that would otherwise ask for a
+password.
 
-### Why one line is the whole job
+### `sufficient` means password **or** phone
 
-Debian and Ubuntu deliberately factor authentication through a single file.
-`/etc/pam.d/common-auth` is included by `sudo`, `sudo-i`, `login`, `su`, `sshd`,
-`gdm-password`, `chfn`, `chsh`, `cups`, `cron` and others — and `/etc/pam.d/other`
-includes it too, which is the fallback for *any* service with no file of its own.
+`sufficient` is not MFA. A successful phone check satisfies the stack; if the
+phone is absent, unavailable or declines, `pam_unix` still runs and the password
+works. That is deliberate availability, but it also means the phone is not a
+second factor at that prompt.
 
-That last part is what covers GNOME's password dialog. polkitd validates a typed
-password by opening a PAM transaction named `polkit-1`. There is no
-`/etc/pam.d/polkit-1` file, so libpam falls through to `other`, and from there into
-`common-auth`. **The polkit dialog authenticates through PAM.**
+If you want password **and** phone, use `required` for both (or a required
+substack) and keep a root TTY open while testing. A lost phone then needs that
+recovery path rather than a normal login. Do not add `debug` to an installed
+line: it is a troubleshooting flag and can write operational detail to syslog.
 
-This is the same mechanism `pam_fprintd` uses, and it is why a fingerprint reader
-works in `sudo`, at the login screen and in a polkit dialog without anyone editing
-those stacks. We are the phone-shaped equivalent, and we drop into the same slot.
+### Scope and prompt fatigue
 
-No polkit agent is required, and none can do this job: polkit permits one
-authentication agent per subject and the desktop's own agent already owns the
-session. Competing with it is impossible; joining the PAM substrate is trivial.
+A `common-auth`/`system-auth` line applies to `sudo`, `su`, `login`, `sshd`,
+`gdm-password`, polkit through the `other` fallback, and more. That is convenient
+and is also a prompt-fatigue surface: anything that can trigger PAM can ask the
+phone. Start with `sudo`, then add polkit and GDM deliberately.
 
-### `sufficient`, not `required`
+On Arch, polkit uses `system-auth`; GDM has its own `gdm-password` and
+`gdm-fingerprint` stacks. Adding the phone to `system-auth` changes polkit and
+other services, not just `sudo`. Keep a root TTY open and make one change at a
+time.
 
-With `sufficient`, a phone that is out of range, flat, switched off or simply absent
-falls through to the password. The password keeps working, always. The failure mode is
-"the phone did not help", never "I cannot log in".
-
-A malformed argument is reported in the system log and the module skips itself rather
-than aborting the stack, so a typo cannot become a lockout either.
-
-Arguments are whitespace-separated `key=value` pairs: `purpose`, `service`, `device`,
-`timeout_ms`, and a bare `debug` flag. Because libpam splits a configuration line on
-whitespace, a value cannot itself contain a space — write `device=Pixel-9`, not
+Arguments are whitespace-separated `key=value` pairs: `purpose`, `service`,
+`device`, and `timeout_ms`. Because libpam splits a configuration line on
+whitespace, a value cannot contain a space — write `device=Pixel-9`, not
 `device=Pixel 9`.
 
-### Check it before relying on it
+### Check it and roll it back
 
 ```bash
 sudo -k && sudo -k    # forget the cached timestamp, twice
 sudo -v               # should prompt on the phone, with a deliberately wrong password typed
 ```
 
-`tests/common-auth-integration.sh` does the whole thing: inserts the line, checks each
-real service's own stack, then rolls back. Rollback is
-`sudo cp /etc/pam.d/common-auth.bak /etc/pam.d/common-auth`.
+For the sudo-only procedure above, rollback restores the file created by that
+same procedure:
 
-Rollback is `sudo cp /etc/pam.d/sudo.bak /etc/pam.d/sudo`.
+```bash
+sudo cp /etc/pam.d/sudo.bak /etc/pam.d/sudo
+```
+
+If you edited `common-auth` or `system-auth`, restore that file's own backup
+instead. Do not copy a `sudo.bak` over a different stack.
+
+`tests/common-auth-integration.sh` exercises the Debian layout; `tests/pam-integration.sh`
+loads the real module into a dedicated PAM service. Neither is a substitute for a
+root shell and a tested rollback on your machine.
 
 ## Why there is no polkit agent
 

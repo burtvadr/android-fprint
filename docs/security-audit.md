@@ -6,7 +6,8 @@ verification* depend on code paths or deployment details that were not exercised
 when the finding was first written.
 
 - Current tree when this tracker was created: `8e58acb`
-- Review provenance: external design/spec review, 2026-11-18
+- Review provenance: external design/spec review, 2026-11-18; second source
+  review, 2026-11-18 (SEC-001 remediation and SEC-021–SEC-024)
 - Runtime context: one physical Android device (Motorola Edge 30 Ultra), debug
   APK, Arch Linux host
 - New findings are welcome. Use the template at the end and continue the `SEC-`
@@ -36,8 +37,8 @@ when the finding was first written.
 
 | ID | Finding | Status |
 |---|---|---|
-| SEC-001 | Pairing code is not bound to the public keys; an on-path attacker can substitute keys | Confirmed |
-| SEC-002 | Pairing code was truncated to one HMAC byte, leaving only 256 values | Resolved |
+| SEC-001 | Pairing code is not bound to the public keys; an on-path attacker can substitute keys | Resolved |
+| SEC-002 | Pairing code was truncated to one HMAC byte, leaving only 256 values | Resolved (review retracted) |
 | SEC-003 | Broad `common-auth` deployment plus no per-request context creates an MFA-fatigue surface | Confirmed |
 | SEC-004 | No device-to-Linux-user binding; a paired phone can approve another account's PAM request | Confirmed |
 
@@ -47,9 +48,13 @@ when the finding was first written.
 |---|---|---|
 | SEC-005 | No Android Key Attestation; the host cannot distinguish hardware-backed from software keys | Confirmed |
 | SEC-006 | PAM client does not verify the control-socket server; socket path can be overridden | Confirmed |
-| SEC-007 | Network-exposed daemon: no mTLS, no connection cap, no parser fuzzing, wide default bind | Partly confirmed |
+| SEC-007 | Network-exposed daemon: no mTLS, no parser fuzzing; connection/deadline/bind gaps now fixed | Partly confirmed |
 | SEC-008 | Android assurance gaps: no release-signed build; validation is one debug device | Partly confirmed |
 | SEC-009 | PAM module robustness: no `catch_unwind`, FFI `unsafe`, blocking I/O | Needs verification |
+| SEC-021 | Control-socket size limit is checked after an unbounded `read_line` | Resolved |
+| SEC-022 | Caller-controlled authentication timeout is unbounded | Resolved |
+| SEC-023 | Biometric prompt shows unsigned host name and hides signed operation context | Resolved |
+| SEC-024 | Network listener lacks connection/handshake/frame deadlines and wide default bind | Resolved in tree |
 
 ### Low
 
@@ -58,10 +63,10 @@ when the finding was first written.
 | SEC-010 | Timing can reveal whether an account has a paired phone | Needs verification |
 | SEC-011 | Pairing race: operator sees only a device name, not key fingerprint/source | Confirmed |
 | SEC-012 | `phone-authctl --code` is visible in `argv` | Confirmed |
-| SEC-013 | Recommended PAM sample includes `debug` | Confirmed |
+| SEC-013 | Recommended PAM sample includes `debug` | Resolved |
 | SEC-014 | Authentication signature is not bound to the TLS session | Confirmed |
 | SEC-015 | mDNS exposes stable host metadata; linkability/privacy | Needs verification |
-| SEC-016 | PAM integration docs assume Debian-style `common-auth` | Confirmed |
+| SEC-016 | PAM integration docs assume Debian-style `common-auth` | Resolved |
 
 ### Documentation and consistency
 
@@ -70,7 +75,7 @@ when the finding was first written.
 | SEC-017 | Host key path differs between threat model and specification | Confirmed |
 | SEC-018 | Spec says `expires_at` is not extended by skew, then the formula extends it | Confirmed |
 | SEC-019 | Test counts in the review's README excerpt are outdated | Resolved |
-| SEC-020 | Two different rollback lines in the PAM section are confusing | Confirmed |
+| SEC-020 | Two different rollback lines in the PAM section are confusing | Resolved |
 
 ---
 
@@ -79,7 +84,7 @@ when the finding was first written.
 ### SEC-001 — Pairing code is not bound to the public keys
 
 **Severity:** High  
-**Status:** Confirmed  
+**Status:** Resolved  
 **Source:** external review, 2026-11-18  
 **Aliases:** pairing MITM, key substitution, code-vs-key binding  
 **Affected:** `protocol/specification/PROTOCOL.md` §6.0/§6.4,
@@ -124,10 +129,44 @@ trusted as the device, defeating the authentication model.
 4. Update the vectors and add a regression test where a middle party substitutes
    both keys and the resulting codes/MACs must not verify.
 
-**Evidence.** Current code derives `p` from `confirmation_key()` over
-`session_id`, then `code_from_material(&p)`. The key-bearing transcript is used
-only for the MACs, not the code. The specification's §6.4 construction matches
-this.
+**Evidence (pre-fix).** The old code derived `p` from `confirmation_key()` over
+`session_id`, then `code_from_material(&p)`. The key-bearing transcript was used
+only for the MACs, not the code. The specification's old §6.4 construction
+matched this.
+
+**Remediation.** The pairing secret is now an ephemeral P-256 ECDH shared secret.
+`PAIRING_START` carries `host_eph_pubkey`, `PAIRING_SUBMIT` carries
+`device_eph_pubkey`, and both endpoints derive:
+
+```text
+transcript = session_id || host_id || device_id || host_pubkey || device_pubkey
+          || host_nonce || device_nonce || host_eph_pubkey || device_eph_pubkey
+pairing_secret = HKDF(ECDH_X, "ALP-PAIR-SALT-V1",
+                      "ALP-PAIR-TRANSCRIPT-V2" || transcript)
+p = HMAC(pairing_secret, "ALP-PAIR-V1" || 0x00 || transcript)
+```
+
+The code, `device_mac` and `host_mac` all cover that transcript. Substituting
+either endpoint's long-term or ephemeral key changes the ECDH result and the
+transcript, so the two endpoints derive different codes and MACs. Both ephemeral
+private keys are zeroized after derivation. `PairingSession::checked_transcript`
+refuses to MAC a transcript other than the one the secret was bound to.
+
+**Regression tests.**
+
+- `linux/protocol/src/pairing.rs::man_in_the_middle_cannot_make_both_codes_match`
+  terminates the exchange on both sides with substituted keys and asserts the
+  host and phone codes differ.
+- `::code_is_bound_to_the_public_keys` changes only the device key and asserts the
+  code changes.
+- `::code_changes_with_the_device_nonce`, `::macs_verify_and_detect_substitution`.
+- The Kotlin device side reproduces the Rust code and MACs through the shared
+  vectors (`make vectors-kt`), including the new ephemeral keys.
+
+**Residual risk.** The six-digit code is a short SAS, so an active attacker can
+try to find two ephemeral keys whose codes collide (about `2^20` work per live
+session). Pairing is single-use, time-limited and rate-limited; a reviewed PAKE
+would remove the grinding bound and remains the stronger long-term option.
 
 ---
 
@@ -150,8 +189,13 @@ needed at most 256 guesses, not 1,000,000.
 
 **Current state.** The code now uses rejection sampling over 32-bit words from the
 HMAC, with a deterministic HMAC expansion if every word is rejected. The
-specification and both implementations use the same algorithm. This is
-independent of SEC-001: the code is uniform now, but still not bound to the keys.
+specification and both implementations use the same algorithm. The same reviewer
+retracted this preliminary finding after checking current `main`: the `p[0]`
+excerpt described an older tree. It is retained here as resubmission history, not
+as an open vulnerability.
+
+The code is now also bound to the keys via SEC-001, so uniformity and key binding
+are both addressed.
 
 **Evidence.** `code_from_material` in `linux/protocol/src/pairing.rs`; the
 Kotlin `PairingSession.code()` mirrors it; vectors were regenerated.
@@ -205,6 +249,13 @@ prompt-triggering surfaces.
 
 **Evidence.** README PAM sample; `AuthRequest::signedCore()` and §8.1 field table;
 `Engine::rate_auth` is keyed by transport and is in-memory.
+
+**Partial remediation (docs).** The README no longer recommends a global
+`common-auth` line by default: it starts with a `sudo`-scoped Arch example,
+explains that `sufficient` is password **or** phone rather than MFA, and warns
+about prompt scope. Number matching, per-user/device rate limits and more signed
+context are still open; this remains a real fatigue surface wherever a broad
+stack is enabled.
 
 ---
 
@@ -329,15 +380,17 @@ socket file owner/mode before connecting, and add a test with a fake socket.
   authenticate the device at TLS. Protocol frames are parsed before any
   device-level signature check; the session/hello and pairing frames are expected
   to arrive first.
-- The default `Config` binds `0.0.0.0:47123`; the installed systemd unit uses that
-  default. The README's local quick-start uses `--bind 127.0.0.1`.
+- **Fixed:** the default `Config` now binds `127.0.0.1:47123`. The systemd unit
+  passes `--bind 0.0.0.0:47123` explicitly because a phone on the LAN needs it;
+  that is an operator/deployment choice, not a library default.
 - The auth rate limiter is an in-memory `RateLimiter` per transport, not per
   source address, target user, or device; it resets on restart. The review's
   "per source address" description is inaccurate for the current code, but the
   reset and shared-scope concerns are real.
-- No connection cap, accept/backoff limit, or explicit TLS-handshake timeout was
-  found in the server loop. Pairing has a protocol timeout; raw TLS/HTTP-style
-  resource exhaustion was not obviously bounded.
+- **Fixed:** the Wi-Fi listener now has a 64-connection semaphore, a 10 s TLS
+  handshake deadline, a 15 s session-setup deadline and a 180 s idle frame
+  deadline. The control socket has a 32-connection cap and 10 s read/write
+  deadlines (SEC-021).
 - No fuzz target for the frame/CBOR parser was found. The parser has extensive
   conformance/rejection tests, but that is not fuzzing.
 
@@ -349,13 +402,15 @@ availability and defence in depth are weaker than the design claims.
 **Recommendation.**
 
 - Keep the default bind on loopback or a specific interface; require an explicit
-  opt-in for LAN-wide binding. The phone needs LAN access, but the host should
-  choose the interface.
+  opt-in for LAN-wide binding. **Done in the tree:** loopback default and an
+  explicit unit flag.
 - Add a connection cap, handshake timeout, and slowloris-style read budget.
+  **Done in the tree:** see SEC-024.
 - Add a persistent/global limiter keyed by peer address, target user and device.
 - Add a fuzz target for `Frame`/`Message`/CBOR decoding.
 - Document that TLS is server-authenticated only and protocol signatures are the
-  device authentication; do not call it mTLS.
+  device authentication; do not call it mTLS. **Done:** the transport module and
+  specification say server-authenticated TLS, not mTLS.
 
 ---
 
@@ -474,13 +529,13 @@ as low-value because it is only a pairing confirmation; do not log it.
 ### SEC-013 — Recommended PAM line includes `debug`
 
 **Severity:** Low  
-**Status:** Confirmed  
+**Status:** Resolved  
 **Source:** external review, 2026-11-18  
 **Affected:** `README.md` PAM section
 
-The sample line is `purpose=auth debug`. Debug output can leak operational detail
-to syslog. Remove `debug` from the recommended line and document it as a
-troubleshooting-only flag.
+The sample line was `purpose=auth debug`. Debug output can leak operational detail
+to syslog. **Resolved:** the recommended line no longer includes `debug`, and the
+README documents it as troubleshooting-only.
 
 ### SEC-014 — Auth response is not bound to the TLS session
 
@@ -515,16 +570,15 @@ considering an ephemeral display label or rotating advertisement where practical
 ### SEC-016 — PAM integration docs assume Debian-style `common-auth`
 
 **Severity:** Low  
-**Status:** Confirmed  
+**Status:** Resolved  
 **Source:** external review, 2026-11-18  
 **Affected:** `README.md` PAM section, `tests/common-auth-integration.sh`,
 `packaging/arch/install-local.sh`
 
 The recommended `common-auth` change is Debian/Ubuntu-specific. Arch uses
 `system-auth` and `sudo` includes it; this machine required a sudo-scoped line and
-a `--host-name %H` unit change. Recommend distro-specific instructions (Debian
-`common-auth`, Arch `/etc/pam.d/sudo` plus `system-auth`, Fedora equivalent) and a
-verification matrix. Do not claim one line covers every distro without testing.
+a `--host-name %H` unit change. **Resolved:** the README now has a distro table,
+defaults to the Arch `sudo`-scoped example, and distinguishes polkit/GDM stacks.
 
 ---
 
@@ -559,7 +613,7 @@ normative behaviour or the table is; update the other.
 **Status:** Resolved  
 **Affected:** `README.md`
 
-The review mentioned 188/168 tests. The current tree reports 194 Rust tests and
+The review mentioned 188/168 tests. The current tree reports 198 Rust tests and
 31 Android unit tests; lint, vectors and the end-to-end smoke test pass. The
 review was working from an older snippet. Keep the counts in the README updated
 when the suite changes.
@@ -567,13 +621,138 @@ when the suite changes.
 ### SEC-020 — Confusing PAM rollback lines
 
 **Severity:** Low  
-**Status:** Confirmed  
+**Status:** Resolved  
 **Affected:** `README.md` PAM section
 
-The PAM section creates `common-auth.bak`, then later says rollback is from
-`sudo.bak` without explaining that it belongs to a different test. A reader can
-restore the wrong file. Separate the two procedures, or make each rollback line
-refer explicitly to the file created in that procedure.
+The PAM section created `common-auth.bak`, then later said rollback was from
+`sudo.bak` without explaining that it belonged to a different test. A reader could
+restore the wrong file. **Resolved:** rollback instructions now refer only to the
+backup created by the same procedure.
+
+---
+
+## Findings from the second source review
+
+### SEC-021 — Control-socket request limit was checked after a full read
+
+**Severity:** Medium  
+**Status:** Resolved  
+**Source:** second source review, 2026-11-18  
+**Aliases:** IPC memory exhaustion, `read_line`, slowloris on the Unix socket  
+**Affected:** `linux/phone-authd/src/ipc.rs`, `linux/phone-authd/src/server.rs`
+
+**Observation.** `read_request` called `BufReader::read_line`, which grows a
+`String` until a newline arrives, and only then compared the length with 64 KiB.
+A client with access to the control socket could stream without a newline and
+make the daemon buffer unboundedly before the check ran. The server also spawned
+one task per accepted connection with no cap or deadline.
+
+**Impact.** Local denial of service by a process in the `phone-auth` group or
+root. The socket is not network-reachable, so this is not an unauthenticated
+remote attack.
+
+**Remediation.** `read_request` now uses `fill_buf`/`consume`, rejects as soon as
+`MAX_REQUEST_BYTES` would be exceeded, and never allocates the complete body
+before checking. The server caps concurrent control connections at 32 and applies
+a 10 s read and write deadline per request/reply. A connection that cannot get a
+slot is dropped rather than queued.
+
+**Evidence.** `ipc::MAX_REQUEST_BYTES`, `ipc::read_request`,
+`server::MAX_CONTROL_CONNECTIONS`, `server::CONTROL_IO_TIMEOUT`.
+
+---
+
+### SEC-022 — Authentication timeout was caller-controlled and unbounded
+
+**Severity:** Low–Medium  
+**Status:** Resolved  
+**Source:** second source review, 2026-11-18  
+**Aliases:** pending-slot exhaustion, authenticated local DoS  
+**Affected:** `linux/phone-authd/src/server.rs`, `linux/phone-authd/src/engine.rs`
+
+**Observation.** The control API accepted `timeout_ms` without a maximum. The
+engine holds one pending authentication slot per device, so a caller could keep
+that slot occupied far beyond any valid request lifetime.
+
+**Impact.** An authorised local caller could deny authentication for a device by
+holding the slot. It cannot authenticate as another user or bypass the signature.
+
+**Remediation.** The IPC boundary clamps the timeout to
+`1..AUTH_REQUEST_TTL_MAX * 1000` (currently 300 s). The engine still clears the
+slot on expiry, and protocol requests carry their own `expires_at`, so a late
+response is rejected independently of the caller's timeout.
+
+**Evidence.** `server::MAX_AUTH_TIMEOUT_MS`; the clamp in `dispatch`.
+
+---
+
+### SEC-023 — Biometric approval showed an unsigned host name
+
+**Severity:** Medium  
+**Status:** Resolved  
+**Source:** second source review, 2026-11-18  
+**Aliases:** consent context, display name spoofing, omitted operation  
+**Affected:** `android/app/src/main/kotlin/com/androidfprint/session/AuthenticatorSession.kt`,
+`android/app/src/main/kotlin/com/androidfprint/ui/AuthenticatorScreen.kt`
+
+**Observation.** The prompt used `AuthRequest.displayHostName`, which the protocol
+defines as unsigned advisory text, as if it were the host's identity. It also
+omitted the signed `operation` in some summaries. A compromised paired host could
+therefore present a different name while making a valid signed request.
+
+**Impact.** Consent integrity: the operator could approve a request believing it
+came from another machine. It does not forge the phone's signature.
+
+**Remediation.** The prompt now displays the **locally stored paired-host name**
+plus the signed `host_id` (the authenticated identity), and always shows the
+signed `service` and `operation`. `display_host_name` is no longer used as the
+host identity; `display_detail` remains in a separately marked "unverified
+detail" card. The biometric prompt summary uses the same trusted label and signed
+operation. The success screen repeats the stored name and key id.
+
+**Evidence.** `SessionState.AwaitingApproval/AwaitingBiometric/Approved` carry
+`hostName` and `hostKeyId` from `trustedHostName()`; `RequestPanel` and
+`ApprovedPanel` render those fields.
+
+---
+
+### SEC-024 — Wi-Fi listener had no connection or handshake deadline
+
+**Severity:** Medium  
+**Status:** Resolved in tree  
+**Source:** second source review, 2026-11-18  
+**Aliases:** connection flood, TLS slowloris, stalled frames, wildcard bind  
+**Affected:** `linux/phone-authd/src/transport/wifi.rs`,
+`linux/phone-authd/src/transport/mod.rs`, `linux/phone-authd/src/config.rs`,
+`linux/systemd/phone-authd.service`
+
+**Observation.** The listener spawned a task for every accepted TCP connection,
+ran the TLS handshake without a deadline, and waited for frames without an idle
+deadline. The default bind was `0.0.0.0:47123`, although a source comment claimed
+loopback.
+
+**Impact.** A reachable peer could exhaust descriptors, memory or tasks by opening
+and stalling connections. The wide bind exposed the listener on every interface.
+
+**Remediation.**
+
+- Default `Config::bind_addr` is `127.0.0.1:47123`. The systemd unit passes
+  `--bind 0.0.0.0:47123` explicitly for LAN use and documents the firewall
+  requirement.
+- At most 64 simultaneous Wi-Fi connections (including handshakes); excess
+  accepted sockets are dropped immediately.
+- 10 s TLS handshake deadline, 15 s session-setup deadline and 180 s idle
+  frame-read deadline.
+- TLS remains server-authenticated only; the device is authenticated by the
+  protocol signature, not by a client certificate.
+
+**Residual risk.** Parser fuzzing and a persistent per-peer/per-user rate limiter
+are still open under SEC-007. The systemd unit still needs a firewall or a
+specific interface address in deployments where the LAN is untrusted.
+
+**Evidence.** `wifi::MAX_WIFI_CONNECTIONS`, `wifi::TLS_HANDSHAKE_TIMEOUT`,
+`transport::SESSION_SETUP_TIMEOUT`, `transport::FRAME_READ_TIMEOUT`,
+`Config::default`, `linux/systemd/phone-authd.service`.
 
 ---
 

@@ -311,11 +311,21 @@ class VectorRunner(private val vectorsDir: File) {
         val hostId = Id(Hex.decode(doc.text("host_id")))
         val deviceId = Id(Hex.decode(doc.text("device_id")))
 
-        val s = PairingSession(
+        val hostEph = Hex.decode(doc.obj("host_ephemeral").text("public_key_hex"))
+        val s = PairingSession.withDeviceEphemeralScalar(
             sessionId = Id(Hex.decode(session.text("session_id"))),
             hostNonce = Hex.decode(session.text("host_nonce")),
+            hostEphPublicKey = hostEph,
+            scalar = Hex.decode(doc.obj("device_ephemeral").text("private_scalar_hex")),
+            publicKey = Hex.decode(doc.obj("device_ephemeral").text("public_key_hex")),
         )
-        s.deriveWithDeviceNonce(Hex.decode(session.text("device_nonce")))
+        s.derive(
+            hostId = hostId,
+            deviceId = deviceId,
+            hostPub = hostPub,
+            devicePub = devicePub,
+            deviceNonce = Hex.decode(session.text("device_nonce")),
+        )
 
         check("pairing.code", s.code() == doc.text("code"), "derived code differs from the Rust side")
         check(

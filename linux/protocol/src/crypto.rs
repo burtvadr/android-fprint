@@ -28,6 +28,10 @@ pub const BEGIN_LABEL: &str = "-----BEGIN ANDROID-FPRINT-EC-P256-KEY-----";
 /// Closing half of [`BEGIN_LABEL`].
 pub const END_LABEL: &str = "-----END ANDROID-FPRINT-EC-P256-KEY-----";
 pub const DOMAIN_PAIR: &[u8] = b"ALP-PAIR-V1";
+/// Domain separator for the transcript that is fed into HKDF for the pairing
+/// secret. Binding the transcript here, and again into the code/MACs, is what
+/// makes an unauthenticated ECDH exchange verifiable by the operator.
+pub const DOMAIN_PAIR_TRANSCRIPT: &[u8] = b"ALP-PAIR-TRANSCRIPT-V2";
 /// Expansion domain used only when rejection sampling exhausts the first block.
 pub const DOMAIN_PAIR_CODE: &[u8] = b"ALP-PAIR-CODE-V1";
 pub const SALT_PAIR: &[u8] = b"ALP-PAIR-SALT-V1";

@@ -25,8 +25,9 @@ pub struct Config {
     pub socket_path: PathBuf,
     pub audit_log: PathBuf,
     pub tcp_port: u16,
-    /// TCP bind address. Loopback by default: the device reaches the daemon via
-    /// mDNS-discovered host addresses, not via a wildcard bind.
+    /// TCP bind address. Loopback by default: exposing the port on a LAN is an
+    /// explicit deployment decision (`--bind` / the systemd unit), never a
+    /// library default.
     pub bind_addr: std::net::SocketAddr,
     /// Announce the host over mDNS/DNS-SD.
     pub advertise_mdns: bool,
@@ -54,7 +55,7 @@ impl Default for Config {
             socket_path: PathBuf::from(DEFAULT_SOCKET),
             audit_log: PathBuf::from(DEFAULT_AUDIT_LOG),
             tcp_port: DEFAULT_TCP_PORT,
-            bind_addr: std::net::SocketAddr::from(([0, 0, 0, 0], DEFAULT_TCP_PORT)),
+            bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], DEFAULT_TCP_PORT)),
             advertise_mdns: true,
             transport: android_fprint_protocol::types::Transport::Wifi,
             device_endpoint: None,

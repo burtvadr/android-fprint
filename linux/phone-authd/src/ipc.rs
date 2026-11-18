@@ -201,25 +201,51 @@ impl ControlResponse {
     }
 }
 
-/// Reads one newline-delimited JSON request.
+/// Hard cap on one control request, including the trailing newline.
+pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
+/// Reads one newline-delimited JSON request with a *bounded* buffer.
+///
+/// `read_line` grows its `String` until it finds a newline, so a client that
+/// streams data forever can exhaust memory before any size check runs. This
+/// implementation inspects the buffered bytes first and rejects the request as
+/// soon as the cap is exceeded, so allocation never goes above
+/// `MAX_REQUEST_BYTES` plus one buffered chunk.
 pub async fn read_request<R>(reader: &mut BufReader<R>) -> io::Result<Option<ControlRequest>>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
-    if n == 0 {
-        return Ok(None);
+    let mut line: Vec<u8> = Vec::with_capacity(512);
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            // EOF without a newline: no more requests.
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "control request ended before a newline",
+                ))
+            };
+        }
+        let newline = available.iter().position(|b| *b == b'\n');
+        let take = newline.unwrap_or(available.len());
+        if line.len() + take > MAX_REQUEST_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request too large",
+            ));
+        }
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take + usize::from(newline.is_some()));
+        if newline.is_some() {
+            break;
+        }
     }
-    // Cap the request size so a client cannot make the daemon buffer
-    // unboundedly.
-    if line.len() > 64 * 1024 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "request too large",
-        ));
-    }
-    match serde_json::from_str::<ControlRequest>(line.trim()) {
+    let text = std::str::from_utf8(&line)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "request is not UTF-8"))?;
+    match serde_json::from_str::<ControlRequest>(text.trim()) {
         Ok(r) => Ok(Some(r)),
         Err(e) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -341,6 +367,23 @@ mod tests {
         let big = format!("{{\"cmd\":\"list\",\"x\":\"{}\"}}\n", "A".repeat(70_000));
         let mut r = BufReader::new(big.as_bytes());
         assert!(read_request(&mut r).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_stream_without_a_newline_is_cut_off_at_the_limit() {
+        // The old read_line implementation buffered this entire slice before it
+        // checked the length. The bounded reader must reject it.
+        let endless = vec![b'A'; MAX_REQUEST_BYTES + 1];
+        let mut r = BufReader::new(&endless[..]);
+        let err = read_request(&mut r).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn a_valid_request_still_parses_after_the_bounded_read() {
+        let mut r = BufReader::new(&b"{\"cmd\":\"list\"}\n"[..]);
+        let request = read_request(&mut r).await.unwrap().unwrap();
+        assert!(matches!(request, ControlRequest::List));
     }
 
     #[tokio::test]

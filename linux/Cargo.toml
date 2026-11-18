@@ -12,7 +12,7 @@ license = "Apache-2.0"
 android-fprint-protocol = { path = "protocol" }
 base64 = "0.22"
 
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic", "std"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "std"] }
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
 hmac = { version = "0.12", default-features = false, features = ["std"] }
 hkdf = { version = "0.12", default-features = false, features = ["std"] }

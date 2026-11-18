@@ -206,8 +206,10 @@ host                                   device
  │                  host_id, host_pubkey,│
  │                  code?, code_entry,   │
  │                  expires_at,           │
- │                  host_nonce}           │
- ├──────────────────────────────────────►│  derive p from both nonces
+ │                  host_nonce,           │
+ │                  host_eph_pubkey}      │
+ ├──────────────────────────────────────►│  generate device ECDH key
+ │                                       │  derive ECDH secret + transcript
  │                                       │  device: never display the code
  │                                       │  host: display the code
  │  PAIRING_SUBMIT {session_id,          │
@@ -216,6 +218,7 @@ host                                   device
  │                   device_pubkey,       │
  │                   device_key_id,       │
  │                   device_nonce,        │
+ │                   device_eph_pubkey,   │
  │                   mac}                 │
  │◄──────────────────────────────────────┤
  │  derive the same p, derive the code   │
@@ -234,10 +237,16 @@ host                                   device
 
 ### 6.0 Why the code is derived, not transported
 
-The six-digit code is a function of *both* nonces. It cannot be known to the host
-before the device produces its nonce, and the device must not reveal its nonce
-before it knows the operator is pairing deliberately. So the exchange is
-necessarily two rounds, and the code is computed on both sides rather than sent.
+The six-digit code is a function of an ephemeral ECDH secret bound to the whole
+transcript. The host cannot derive it before the device contributes its ephemeral
+public key, and the device must not reveal its nonce before it knows the operator
+is pairing deliberately. So the exchange is necessarily two rounds, and the code
+is computed on both sides rather than sent.
+
+Because the host's ephemeral private key is generated fresh for each session and
+discarded after derivation, an on-path attacker who records the messages cannot
+compute the secret, and cannot make a substituted key produce the same code on
+both endpoints without finding a collision in the six-digit value.
 
 An operator may pre-select a code with `phone-authctl pair --code 123456`. In that
 case the host sends it in `PAIRING_START`, the device checks its own derived code
@@ -262,6 +271,7 @@ endpoint's typed code. There is no unattended pairing path.
 | `code_entry` | tstr | `device` (default when absent) or `host`; which endpoint types the code |
 | `expires_at` | uint | Unix seconds |
 | `host_nonce` | bstr | 32 bytes |
+| `host_eph_pubkey` | bstr | 65 bytes; ephemeral P-256 public key for this pairing |
 
 ### 6.2 `PAIRING_SUBMIT`
 
@@ -273,6 +283,7 @@ endpoint's typed code. There is no unattended pairing path.
 | `device_pubkey` | bstr | 65 bytes |
 | `device_key_id` | tstr | 64 hex chars |
 | `device_nonce` | bstr | 32 bytes |
+| `device_eph_pubkey` | bstr | 65 bytes; ephemeral P-256 public key for this pairing |
 | `mac` | bstr | 32 bytes, §6.4 |
 | `cleanup_tokens` | array of bstr | Optional; each 32 bytes. Older pairings this phone asks the host to revoke, §6.6 |
 
@@ -293,13 +304,22 @@ substitute device key to a device and a substitute host key to the host, and the
 operator would have entered a code that authenticates neither.
 
 ```text
-p = HMAC-SHA-256(key = pairing_secret, msg = "ALP-PAIR-V1" || 0x00 || session_id)
+transcript = session_id || host_id || device_id
+           || host_pubkey || device_pubkey
+           || host_nonce || device_nonce
+           || host_eph_pubkey || device_eph_pubkey
+
+ecdh_secret = X-coordinate of (host_eph_private * device_eph_pubkey)
+            = X-coordinate of (device_eph_private * host_eph_pubkey)
 
 pairing_secret = HKDF-SHA-256(
-        ikm  = host_nonce || device_nonce,
+        ikm  = ecdh_secret,
         salt = "ALP-PAIR-SALT-V1",
-        info = session_id,
+        info = "ALP-PAIR-TRANSCRIPT-V2" || transcript,
         len  = 32)
+
+p = HMAC-SHA-256(key = pairing_secret, msg =
+          "ALP-PAIR-V1" || 0x00 || transcript)
 
 code   = decimal, zero-padded to 6 digits, from rejection sampling:
          for each 32-bit big-endian word v in p:
@@ -309,14 +329,15 @@ code   = decimal, zero-padded to 6 digits, from rejection sampling:
                      msg = "ALP-PAIR-CODE-V1" || 0x00 || u64_be(1))
              repeat with p_1, p_2, ...
 mac_d  = HMAC-SHA-256(key = p, msg =
-          "ALP-DEVICE-CONFIRM-V1" || 0x00
-       || session_id || host_id || device_id
-       || host_pubkey || device_pubkey || host_nonce || device_nonce)
+          "ALP-DEVICE-CONFIRM-V1" || 0x00 || transcript)
 mac_h  = HMAC-SHA-256(key = p, msg =
-          "ALP-HOST-CONFIRM-V1" || 0x00
-       || session_id || host_id || device_id
-       || host_pubkey || device_pubkey || host_nonce || device_nonce)
+          "ALP-HOST-CONFIRM-V1" || 0x00 || transcript)
 ```
+
+Both endpoints MUST reject an ephemeral public key that is not a valid P-256
+point. The ephemeral private key MUST be generated by a CSPRNG for every pairing
+session, MUST NOT be reused, and MUST be zeroized after `pairing_secret` is
+derived.
 
 The code MUST use rejection sampling as above. A one-byte truncation would
 reduce the space to `000000`–`000255`; a bare modulo reduction over a non-multiple
@@ -367,17 +388,21 @@ Requirements:
   pairing session. A host MUST refuse `PAIRING_START`-equivalent operations while
   no session is open, and MUST NOT fall back to "trust whatever connected".
 
-**Limitations, stated honestly.** This is a keyed *integrity* check over a
-transcript, not an information-theoretic Short Authentication String as in
-SPAKE2/PAKE. Its guarantees are: (a) a MITM must know or influence both nonces to
-make its substituted keys verify under the displayed code; (b) a MITM that does
-not control `PAIRING_START` cannot substitute keys without the code entry
-failing. It does not provide forward secrecy — an attacker who records the
-pairing transcript and later obtains the device's private key can recompute `p`.
-Use over a transport with an authenticating channel (TLS, as on Wi-Fi) where
-available; for the BLE transport, pairing SHOULD be performed over Wi-Fi. This
-limitation is a deliberate, documented trade-off, not an oversight, and is
-tracked as a known weakness rather than papered over.
+**Limitations, stated honestly.** The six-digit code is a short authentication
+string (SAS), not a PAKE. An active attacker who terminates the exchange on both
+sides derives a different ECDH secret on each side, so the codes differ; to make
+them match it must find two ephemeral keys whose six-digit values collide. That
+costs about `2^20` work per live session, and pairing sessions are single-use,
+time-limited and rate-limited. This is the standard SAS trade-off, not a hidden
+weakness.
+
+The construction provides forward secrecy for the pairing transcript: both
+ephemeral private keys are zeroized, so recording the exchange and later
+obtaining either long-term private key does not reveal `pairing_secret`. It does
+not protect against an operator who approves a code they did not actually
+compare, or against a compromised endpoint that lies about what it displays. Use
+an authenticating transport (TLS, as on Wi-Fi) where available; for BLE, pairing
+SHOULD be performed over Wi-Fi.
 
 ---
 

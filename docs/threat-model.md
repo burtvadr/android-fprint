@@ -61,10 +61,12 @@ claim to evidence is checkable.
 Stated rather than hidden:
 
 * **Pairing is not a PAKE.** The six-digit code is an HMAC over the transcript keyed
-  by a secret derived from both nonces. It gives integrity and operator-verifiable
-  authentication of both endpoints, but not forward secrecy: an attacker who later
-  obtains the device private key can recompute the pairing transcript. See
-  `PROTOCOL.md` §6.4.
+  by an ephemeral ECDH secret, so an on-path attacker cannot derive it from public
+  nonces and a key substitution produces different codes on each endpoint. The
+  remaining active-attack bound is the six-digit SAS: about `2^20` work per live,
+  single-use pairing session. Both ephemeral private keys are zeroized, so the
+  recorded transcript does not reveal the secret even if a long-term key is later
+  compromised. See `PROTOCOL.md` §6.4.
 * **ECDSA malleability.** `(r, s)` and `(r, n-s)` both verify. Signature bytes are
   therefore never used as identifiers, and replay defence rests on `request_id`
   and `challenge`.

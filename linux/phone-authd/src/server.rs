@@ -23,6 +23,18 @@ use crate::transport;
 /// complete a fingerprint check plus a confirmation dialog.
 pub const DEFAULT_AUTH_TIMEOUT_MS: u64 = 90_000;
 
+/// Hard cap on a caller-supplied authentication timeout. The protocol's
+/// authentication request lifetime is the natural upper bound: a request that
+/// lives longer than this cannot be valid anyway.
+pub const MAX_AUTH_TIMEOUT_MS: u64 = android_fprint_protocol::types::AUTH_REQUEST_TTL_MAX * 1_000;
+
+/// Concurrent control-socket connections. PAM and the CLI are one-shot clients,
+/// so this is far above normal use while still bounding descriptors and tasks.
+const MAX_CONTROL_CONNECTIONS: usize = 32;
+
+/// Time allowed to send one request or receive one response.
+const CONTROL_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Binds the control socket with restricted permissions.
 ///
 /// Must be called from inside the Tokio runtime: converting a std listener into a
@@ -67,6 +79,7 @@ pub async fn serve_control(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let listener = bind_control_socket(&config.socket_path)?;
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONTROL_CONNECTIONS));
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -92,9 +105,19 @@ pub async fn serve_control(
                         return Err(ProtocolError::Internal(format!("accept: {e}")));
                     }
                 };
+                let permit = match Arc::clone(&slots).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        // Dropping `stream` closes the connection. A client that
+                        // cannot get a slot is refused rather than queued, so
+                        // stalled callers cannot accumulate tasks.
+                        continue;
+                    }
+                };
                 let engine = engine.clone();
                 let cfg = config.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = handle_control_connection(engine.clone(), stream, cfg).await {
                         engine
                             .audit()
@@ -120,17 +143,22 @@ async fn handle_control_connection(
     let mut reader = BufReader::new(r);
     let mut writer = w;
 
-    let Some(request) = ipc::read_request(&mut reader)
+    let Some(request) = tokio::time::timeout(CONTROL_IO_TIMEOUT, ipc::read_request(&mut reader))
         .await
+        .map_err(|_| ProtocolError::BadRequest("control request timed out".into()))?
         .map_err(|e| ProtocolError::BadRequest(format!("control request: {e}")))?
     else {
         return Ok(());
     };
 
     let response = dispatch(&engine, &config, peer, request).await;
-    ipc::write_response(&mut writer, &response)
-        .await
-        .map_err(|e| ProtocolError::Internal(format!("write control response: {e}")))?;
+    tokio::time::timeout(
+        CONTROL_IO_TIMEOUT,
+        ipc::write_response(&mut writer, &response),
+    )
+    .await
+    .map_err(|_| ProtocolError::Internal("control response timed out".into()))?
+    .map_err(|e| ProtocolError::Internal(format!("write control response: {e}")))?;
     Ok(())
 }
 
@@ -226,7 +254,9 @@ async fn dispatch(
                     service: &service,
                     operation: &operation,
                     device_selector: device.as_deref(),
-                    timeout_ms: timeout_ms.unwrap_or(DEFAULT_AUTH_TIMEOUT_MS),
+                    timeout_ms: timeout_ms
+                        .unwrap_or(DEFAULT_AUTH_TIMEOUT_MS)
+                        .clamp(1, MAX_AUTH_TIMEOUT_MS),
                     transport_pref: config.transport,
                 })
                 .await

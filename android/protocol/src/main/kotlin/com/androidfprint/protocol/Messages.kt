@@ -1,6 +1,20 @@
 package com.androidfprint.protocol
 
+import java.math.BigInteger
+import java.security.AlgorithmParameters
+import java.security.KeyFactory
+import java.security.KeyPair
+import java.security.KeyPairGenerator
 import java.security.MessageDigest
+import java.security.PrivateKey
+import java.security.PublicKey
+import java.security.interfaces.ECPublicKey
+import java.security.spec.ECGenParameterSpec
+import java.security.spec.ECParameterSpec
+import java.security.spec.ECPoint
+import java.security.spec.ECPrivateKeySpec
+import java.security.spec.ECPublicKeySpec
+import javax.crypto.KeyAgreement
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -57,6 +71,8 @@ object Limits {
 object Domains {
     val SIGNING = "ANDROID_LINUX_AUTH_V1".toByteArray(Charsets.UTF_8)
     val PAIR = "ALP-PAIR-V1".toByteArray(Charsets.UTF_8)
+    /** Domain separator for the transcript fed into the pairing HKDF. */
+    val PAIR_TRANSCRIPT = "ALP-PAIR-TRANSCRIPT-V2".toByteArray(Charsets.UTF_8)
     val SALT_PAIR = "ALP-PAIR-SALT-V1".toByteArray(Charsets.UTF_8)
     val DEVICE_CONFIRM = "ALP-DEVICE-CONFIRM-V1".toByteArray(Charsets.UTF_8)
     val HOST_CONFIRM = "ALP-HOST-CONFIRM-V1".toByteArray(Charsets.UTF_8)
@@ -487,6 +503,8 @@ data class PairingStart(
     val codeEntry: CodeEntry = CodeEntry.DEVICE,
     val expiresAt: Long,
     val hostNonce: ByteArray,
+    /** Host ephemeral ECDH public key (SEC1 uncompressed, 65 bytes). */
+    val hostEphPublicKey: ByteArray,
 ) {
     fun toPayload(): ByteArray = Cbor.encode(
         Cbor.ofMap(
@@ -496,6 +514,7 @@ data class PairingStart(
             "host_id" to Cbor.bytes(hostId.bytes),
             "host_key_id" to Cbor.text(hostKeyId),
             "host_nonce" to Cbor.bytes(hostNonce),
+            "host_eph_pubkey" to Cbor.bytes(hostEphPublicKey),
             "host_pubkey" to Cbor.bytes(hostPublicKey),
             "session_id" to Cbor.bytes(sessionId.bytes),
         )
@@ -522,6 +541,16 @@ data class PairingStart(
             if (nonce.size != Limits.CHALLENGE_LEN) {
                 throw ProtocolException(ErrorCode.BAD_REQUEST, "host_nonce must be 32 bytes")
             }
+            val hostEph = (v["host_eph_pubkey"] as? Cbor.Value.Bytes)?.value
+                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "missing host_eph_pubkey")
+            if (hostEph.size != Limits.PUBKEY_LEN) {
+                throw ProtocolException(
+                    ErrorCode.BAD_REQUEST,
+                    "host_eph_pubkey must be 65 bytes",
+                )
+            }
+            // Reject off-curve points before they reach the ECDH implementation.
+            decodeEcpPublicKey(hostEph)
             return PairingStart(
                 sessionId = Id((v["session_id"] as Cbor.Value.Bytes).value),
                 hostId = Id((v["host_id"] as Cbor.Value.Bytes).value),
@@ -531,6 +560,7 @@ data class PairingStart(
                 codeEntry = codeEntry,
                 expiresAt = (v["expires_at"] as Cbor.Value.Uint).value,
                 hostNonce = nonce,
+                hostEphPublicKey = hostEph,
             )
         }
     }
@@ -543,6 +573,8 @@ data class PairingSubmit(
     val devicePublicKey: ByteArray,
     val deviceKeyId: String,
     val deviceNonce: ByteArray,
+    /** Device ephemeral ECDH public key (SEC1 uncompressed, 65 bytes). */
+    val deviceEphPublicKey: ByteArray,
     val mac: ByteArray,
     /** Revocation tokens for older pairings this phone asks the host to clean up. */
     val cleanupTokens: List<ByteArray> = emptyList(),
@@ -553,6 +585,7 @@ data class PairingSubmit(
             "device_key_id" to Cbor.text(deviceKeyId),
             "device_name" to Cbor.text(deviceName),
             "device_nonce" to Cbor.bytes(deviceNonce),
+            "device_eph_pubkey" to Cbor.bytes(deviceEphPublicKey),
             "device_pubkey" to Cbor.bytes(devicePublicKey),
             "mac" to Cbor.bytes(mac),
             "session_id" to Cbor.bytes(sessionId.bytes),
@@ -575,6 +608,15 @@ data class PairingSubmit(
             if (nonce.size != Limits.CHALLENGE_LEN) {
                 throw ProtocolException(ErrorCode.BAD_REQUEST, "device_nonce must be 32 bytes")
             }
+            val deviceEph = (v["device_eph_pubkey"] as? Cbor.Value.Bytes)?.value
+                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "missing device_eph_pubkey")
+            if (deviceEph.size != Limits.PUBKEY_LEN) {
+                throw ProtocolException(
+                    ErrorCode.BAD_REQUEST,
+                    "device_eph_pubkey must be 65 bytes",
+                )
+            }
+            decodeEcpPublicKey(deviceEph)
             val cleanupTokens = when (val raw = v["cleanup_tokens"]) {
                 null -> emptyList()
                 is Cbor.Value.Arr -> raw.items.map { entry ->
@@ -603,6 +645,7 @@ data class PairingSubmit(
                 devicePublicKey = (v["device_pubkey"] as Cbor.Value.Bytes).value,
                 deviceKeyId = (v["device_key_id"] as Cbor.Value.Text).value,
                 deviceNonce = nonce,
+                deviceEphPublicKey = deviceEph,
                 mac = mac,
                 cleanupTokens = cleanupTokens,
             )
@@ -683,28 +726,75 @@ data class Unpair(val token: ByteArray) {
 /**
  * The device side of the pairing confirmation (`PROTOCOL.md` §6.4).
  *
- * The six-digit code is a function of *both* nonces, so neither side can know it
- * before the other has contributed one. This is why the exchange is two rounds.
+ * The six-digit code is derived from an ephemeral ECDH secret over the full
+ * transcript: session id, host/device ids, both long-term public keys, both
+ * nonces and both ephemeral public keys. A network attacker who substitutes
+ * either endpoint's keys computes a different secret on each side, so the codes
+ * shown on the two screens do not match. That is the property the old
+ * public-nonce-only construction lacked.
  *
- * Limitations are documented in the specification: this is a keyed integrity
- * check over the transcript, not an information-theoretic SAS as in SPAKE2. It
- * does not provide forward secrecy.
+ * The code is still a short authentication string, not a PAKE: an active attacker
+ * gets about one success in 10^6 per live, rate-limited pairing session.
  */
-class PairingSession(val sessionId: Id, val hostNonce: ByteArray) {
+class PairingSession private constructor(
+    val sessionId: Id,
+    val hostNonce: ByteArray,
+    val hostEphPublicKey: ByteArray,
+    private val deviceKeyPair: KeyPair,
+) {
     private var deviceNonce: ByteArray? = null
     private var secret: ByteArray? = null
+    private var transcript: ByteArray? = null
 
-    fun deriveWithDeviceNonce(nonce: ByteArray) {
-        require(nonce.size == Limits.CHALLENGE_LEN) { "device nonce must be 32 bytes" }
-        deviceNonce = nonce
-        val ikm = hostNonce + nonce
-        secret = hkdf(ikm = ikm, salt = Domains.SALT_PAIR, info = sessionId.bytes, length = 32)
-        ikm.fill(0)
+    /** The device's ephemeral ECDH public key, sent in `PAIRING_SUBMIT`. */
+    val deviceEphemeralPublicKey: ByteArray by lazy {
+        encodeEcpPublicKey(deviceKeyPair.public as ECPublicKey)
+    }
+
+    constructor(sessionId: Id, hostNonce: ByteArray, hostEphPublicKey: ByteArray) : this(
+        sessionId,
+        hostNonce,
+        hostEphPublicKey,
+        generateP256KeyPair(),
+    )
+
+    /**
+     * Binds the complete transcript and derives the shared secret.
+     *
+     * Call after the device nonce exists and before [code], [deviceMac] or
+     * [hostMac]. The same host/device identity arguments must be used for all
+     * three, otherwise the methods refuse rather than confirm a different
+     * transcript.
+     */
+    @Suppress("LongParameterList")
+    fun derive(
+        hostId: Id,
+        deviceId: Id,
+        hostPub: ByteArray,
+        devicePub: ByteArray,
+        deviceNonce: ByteArray,
+    ) {
+        require(deviceNonce.size == Limits.CHALLENGE_LEN) { "device nonce must be 32 bytes" }
+        require(hostEphPublicKey.size == Limits.PUBKEY_LEN) {
+            "host ephemeral key must be 65 bytes"
+        }
+        val peer = decodeEcpPublicKey(hostEphPublicKey)
+        val shared = ecdh(deviceKeyPair.private, peer)
+        try {
+            val t = transcriptWith(hostId, deviceId, hostPub, devicePub, deviceNonce)
+            val info = Domains.PAIR_TRANSCRIPT + t
+            secret = hkdf(ikm = shared, salt = Domains.SALT_PAIR, info = info, length = 32)
+            transcript = t
+            this.deviceNonce = deviceNonce.copyOf()
+        } finally {
+            shared.fill(0)
+        }
     }
 
     private fun confirmationKey(): ByteArray {
-        val s = secret ?: throw IllegalStateException("deriveWithDeviceNonce must be called first")
-        return hmac(s, Domains.PAIR + byteArrayOf(0x00) + sessionId.bytes)
+        val s = secret ?: throw IllegalStateException("derive must be called first")
+        val t = transcript ?: throw IllegalStateException("derive must be called first")
+        return hmac(s, Domains.PAIR + byteArrayOf(0x00) + t)
     }
 
     /**
@@ -744,17 +834,135 @@ class PairingSession(val sessionId: Id, val hostNonce: ByteArray) {
         (this ushr (56 - 8 * i)).toByte()
     }
 
-    private fun transcript(hostId: Id, deviceId: Id, hostPub: ByteArray, devicePub: ByteArray): ByteArray =
-        sessionId.bytes + hostId.bytes + deviceId.bytes + hostPub + devicePub + hostNonce +
-            (deviceNonce ?: throw IllegalStateException("no device nonce"))
+    private fun transcriptWith(
+        hostId: Id,
+        deviceId: Id,
+        hostPub: ByteArray,
+        devicePub: ByteArray,
+        deviceNonce: ByteArray,
+    ): ByteArray = sessionId.bytes + hostId.bytes + deviceId.bytes + hostPub + devicePub +
+        hostNonce + deviceNonce + hostEphPublicKey + deviceEphemeralPublicKey
 
-    fun deviceMac(hostId: Id, deviceId: Id, hostPub: ByteArray, devicePub: ByteArray): ByteArray =
-        hmac(confirmationKey(), Domains.DEVICE_CONFIRM + byteArrayOf(0x00) +
-            transcript(hostId, deviceId, hostPub, devicePub))
+    private fun checkedTranscript(
+        hostId: Id,
+        deviceId: Id,
+        hostPub: ByteArray,
+        devicePub: ByteArray,
+    ): ByteArray {
+        val nonce = deviceNonce ?: throw IllegalStateException("derive must be called first")
+        val t = transcriptWith(hostId, deviceId, hostPub, devicePub, nonce)
+        val derived = transcript ?: throw IllegalStateException("derive must be called first")
+        if (!t.contentEquals(derived)) {
+            throw ProtocolException(
+                ErrorCode.CONTEXT_MISMATCH,
+                "pairing transcript does not match the derived secret",
+            )
+        }
+        return t
+    }
 
-    fun hostMac(hostId: Id, deviceId: Id, hostPub: ByteArray, devicePub: ByteArray): ByteArray =
-        hmac(confirmationKey(), Domains.HOST_CONFIRM + byteArrayOf(0x00) +
-            transcript(hostId, deviceId, hostPub, devicePub))
+    fun deviceMac(
+        hostId: Id,
+        deviceId: Id,
+        hostPub: ByteArray,
+        devicePub: ByteArray,
+    ): ByteArray = hmac(
+        confirmationKey(),
+        Domains.DEVICE_CONFIRM + byteArrayOf(0x00) +
+            checkedTranscript(hostId, deviceId, hostPub, devicePub),
+    )
+
+    fun hostMac(
+        hostId: Id,
+        deviceId: Id,
+        hostPub: ByteArray,
+        devicePub: ByteArray,
+    ): ByteArray = hmac(
+        confirmationKey(),
+        Domains.HOST_CONFIRM + byteArrayOf(0x00) +
+            checkedTranscript(hostId, deviceId, hostPub, devicePub),
+    )
+
+    companion object {
+        /**
+         * Deterministic ephemeral key for conformance vectors only. Production
+         * callers must use the public constructor, which generates a fresh key.
+         */
+        fun withDeviceEphemeralScalar(
+            sessionId: Id,
+            hostNonce: ByteArray,
+            hostEphPublicKey: ByteArray,
+            scalar: ByteArray,
+            publicKey: ByteArray,
+        ): PairingSession {
+            require(scalar.size == 32) { "ephemeral scalar must be 32 bytes" }
+            val params = p256Params()
+            val d = BigInteger(1, scalar)
+            require(d.signum() > 0 && d < params.order) { "ephemeral scalar out of range" }
+            val public = decodeEcpPublicKey(publicKey)
+            val private = KeyFactory.getInstance("EC")
+                .generatePrivate(ECPrivateKeySpec(d, params))
+            return PairingSession(sessionId, hostNonce, hostEphPublicKey, KeyPair(public, private))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P-256 ECDH helpers
+// ---------------------------------------------------------------------------
+
+private fun p256Params(): ECParameterSpec {
+    val parameters = AlgorithmParameters.getInstance("EC")
+    parameters.init(ECGenParameterSpec("secp256r1"))
+    return parameters.getParameterSpec(ECParameterSpec::class.java)
+}
+
+internal fun generateP256KeyPair(): KeyPair {
+    val generator = KeyPairGenerator.getInstance("EC")
+    generator.initialize(ECGenParameterSpec("secp256r1"))
+    return generator.generateKeyPair()
+}
+
+/** Parses an uncompressed P-256 point and rejects off-curve coordinates. */
+internal fun decodeEcpPublicKey(bytes: ByteArray): ECPublicKey {
+    if (bytes.size != Limits.PUBKEY_LEN || bytes[0] != 0x04.toByte()) {
+        throw ProtocolException(
+            ErrorCode.BAD_REQUEST,
+            "P-256 public key must be a 65-byte uncompressed point",
+        )
+    }
+    val x = BigInteger(1, bytes.copyOfRange(1, 33))
+    val y = BigInteger(1, bytes.copyOfRange(33, 65))
+    val point = ECPoint(x, y)
+    val params = p256Params()
+    // KeyFactory validates that the point is on secp256r1.
+    return KeyFactory.getInstance("EC")
+        .generatePublic(ECPublicKeySpec(point, params)) as ECPublicKey
+}
+
+internal fun encodeEcpPublicKey(key: ECPublicKey): ByteArray =
+    byteArrayOf(0x04) + toFixed32(key.w.affineX) + toFixed32(key.w.affineY)
+
+private fun toFixed32(value: BigInteger): ByteArray {
+    val raw = value.toByteArray().let {
+        if (it.size > 1 && it[0] == 0.toByte()) it.copyOfRange(1, it.size) else it
+    }
+    require(raw.size <= 32) { "coordinate does not fit in 32 bytes" }
+    return ByteArray(32 - raw.size) + raw
+}
+
+private fun ecdh(privateKey: PrivateKey, peer: PublicKey): ByteArray {
+    val agreement = KeyAgreement.getInstance("ECDH")
+    agreement.init(privateKey)
+    agreement.doPhase(peer, true)
+    val raw = agreement.generateSecret()
+    // JCA normally returns the fixed-width X coordinate. Normalise defensively so
+    // a provider that trims leading zeros still agrees with P-256 ECDH.
+    return when {
+        raw.size == 32 -> raw
+        raw.size > 32 -> raw.copyOfRange(raw.size - 32, raw.size)
+        else -> ByteArray(32 - raw.size) + raw
+    }
 }
 
 // ---------------------------------------------------------------------------

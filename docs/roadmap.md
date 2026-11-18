@@ -471,16 +471,19 @@ ignored, not treated as consent.
 
 Do these before expanding the platform surface:
 
-- [ ] SEC-001: bind the pairing code to the public keys; commit/reveal or PAKE.
+- [x] SEC-001: bind the pairing code to an ephemeral ECDH secret and the full
+      transcript; add the MITM regression test. A PAKE remains a future upgrade.
 - [ ] SEC-003: stop recommending global `common-auth`; scope PAM integration and
       add number matching for authentication.
 - [ ] SEC-004: bind each paired device to allowed Linux users; deny root by
       default.
 - [ ] SEC-005: design opt-in Android Key Attestation and downgrade policy.
 - [ ] SEC-006: verify the control-socket server from the PAM client.
-- [ ] SEC-007: connection caps, handshake timeouts, persistent rate limits,
-      parser fuzzing, explicit bind policy.
+- [ ] SEC-007: persistent rate limits and parser fuzzing remain; connection
+      caps, handshake/frame deadlines and the explicit bind policy are done.
 - [ ] SEC-009: panic containment and FFI review in the PAM module.
+- [x] SEC-021/022/023/024: bounded IPC reads and deadlines, timeout clamp,
+      trusted prompt context, connection caps and frame deadlines.
 - [ ] Release-signed Android build and a test matrix beyond one debug device.
 
 ### Phase 1 — Linux production integration

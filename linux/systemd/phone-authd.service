@@ -6,7 +6,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/libexec/phone-authd --host-name %H
+# Binding the LAN is an explicit deployment choice; the daemon itself defaults to
+# loopback. Restrict the port to your LAN with a firewall (or use a specific
+# interface address) rather than exposing it to untrusted networks.
+ExecStart=/usr/libexec/phone-authd --host-name %H --bind 0.0.0.0:47123
 ExecReload=/bin/kill -HUP $MAINPID
 
 # The daemon verifies signatures and enforces policy. It needs no privilege beyond

@@ -12,9 +12,11 @@ host                                   device
  │                  host_id, host_pubkey,│
  │                  code?, code_entry,   │
  │                  expires_at,          │
- │                  host_nonce }         │
+ │                  host_nonce,          │
+ │                  host_eph_pubkey }    │
  ├──────────────────────────────────────►│
- │                                       │  derive p from both nonces
+ │                                       │  generate device ECDH key
+ │                                       │  derive ECDH secret + transcript
  │                                       │  device: never show the code
  │                                       │  host: show the code
  │  PAIRING_SUBMIT { session_id,         │
@@ -22,6 +24,7 @@ host                                   device
  │                   device_name,        │
  │                   device_pubkey,      │
  │                   device_nonce,       │
+ │                   device_eph_pubkey,  │
  │                   mac }               │
  │◄──────────────────────────────────────┤
  │  derive the same p and code           │
@@ -41,13 +44,20 @@ host displays it and the phone never does. In `host` mode the phone displays it
 and the Linux host never does. The endpoint that displays the code must not accept
 a bare confirmation in place of the other endpoint's typed value.
 
+**Upgrade note.** `host_eph_pubkey` and `device_eph_pubkey` are required. A phone
+or host built before this change cannot complete a new pairing with an updated
+peer; re-pair after upgrading both sides. Already-paired authentication sessions
+are not affected by the pairing-message change, but re-pairing is what enrolls a
+key under the new transcript binding.
+
 Three properties are worth calling out.
 
-**The code is derived, not transported.** It is a function of *both* nonces. The
-host cannot compute it before the device contributes its nonce, and the device
-must not reveal its nonce before it knows an operator is deliberately pairing. So
-the exchange is necessarily two rounds, and both sides compute the code
-independently.
+**The code is derived, not transported.** It is a function of an ephemeral ECDH
+secret over the full transcript: both ids, both long-term keys, both nonces and
+both ephemeral keys. The host cannot compute it before the device contributes
+its ephemeral public key, and the device must not reveal its nonce before it knows
+an operator is deliberately pairing. So the exchange is necessarily two rounds,
+and both sides compute the code independently.
 
 **The MACs are reciprocal.** Each side proves it derived the same secret. The
 operator's code entry is therefore not just a human ritual: if the MACs verify,
@@ -94,10 +104,11 @@ option where it is practical.
 
 | Attack | Outcome |
 |---|---|
-| A different device is substituted in transit | Its MAC differs, so the host rejects it. The operator's code entry cannot match the host's transcript. |
-| A different host is substituted | It cannot produce `host_mac`, so the device rejects it. |
-| Replay of an earlier pairing | Both nonces are fresh CSPRNG output per attempt, so the derived code and MACs differ. |
-| Passive capture of the exchange | The transcript yields the session secret, but that secret is short-lived and no long-term key is transmitted. Only public keys are retained. |
+| A different device is substituted in transit | The host derives a different ECDH secret, so its code differs from the one the phone would derive for the substituted transcript. The MACs also differ. |
+| A different host is substituted | The phone derives a different ECDH secret, so its code differs and `host_mac` does not verify. |
+| Passive capture of the exchange | The ephemeral ECDH secret is never transmitted, and both ephemeral private keys are destroyed after use. Only public keys are retained. |
+| Replay of an earlier pairing | Both nonces and both ephemeral keys are fresh per attempt, so the derived code and MACs differ. |
+| A relay that preserves the code but swaps keys | It must make two different ECDH secrets produce the same six-digit value (~2^20 work per live, single-use session). |
 | An attacker who races the real device | Only one pairing session can be open at a time, and it expires. The second attempt is refused. |
 
 ## What the operator is *not* protected against
@@ -105,12 +116,13 @@ option where it is practical.
 Stated plainly, because the limitation is inherent to the design rather than a
 bug:
 
-* **No forward secrecy.** The session secret is derived from two nonces with
-  HKDF, and the MACs are plain HMAC. An attacker who records the pairing
-  transcript and *later* obtains the device private key can recompute everything
-  and forge a pairing they never participated in. A PAKE (SPAKE2, or an OPAQUE-style
-  construction) would prevent this; this design does not use one, and the trade-off
-  is documented rather than implied away.
+* **The six-digit code is a short SAS, not a PAKE.** An active attacker gets
+  roughly one success in `10^6` per pairing attempt, because it must find two
+  ephemeral keys whose codes collide. Pairing is single-use, time-limited and
+  rate-limited, which bounds online attempts, but a determined attacker with a
+  live session still has that `2^20` window. A reviewed PAKE would remove the
+  offline-grinding component; this design uses ephemeral ECDH plus a
+  transcript-bound SAS instead.
 * **No protection from a dishonest operator.** Someone with physical access to both
   screens can approve anything. That is inherent: the person approving is the trust
   anchor.

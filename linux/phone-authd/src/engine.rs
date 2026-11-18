@@ -442,13 +442,10 @@ impl Engine {
             }
             let session_id = Id::random()?;
             let host_nonce = android_fprint_protocol::crypto::random_array()?;
-            let mut session = PairingSession::new(session_id, host_nonce);
-            // With only the host nonce known the code is not yet final; the
-            // device derives it once it contributes its nonce.
-            let provisional = {
-                session.derive_with_device_nonce([0u8; 32])?;
-                session.code()?
-            };
+            // The session holds an ephemeral ECDH key. Nothing is derived and no
+            // code exists until the device's `PAIRING_SUBMIT` arrives with its
+            // own ephemeral key, so there is no provisional public-nonce code.
+            let session = PairingSession::new(session_id, host_nonce);
             let chosen: Option<String> = match code {
                 Some(c) => {
                     if c.len() != android_fprint_protocol::types::PAIRING_CODE_DIGITS
@@ -464,7 +461,6 @@ impl Engine {
                 // nonces and the operator compares the screens.
                 None => None,
             };
-            let _ = provisional;
             let ttl = android_fprint_protocol::types::PAIRING_TTL;
             let expires_at = now + ttl;
             *guard = Some(ActivePairing {
@@ -503,7 +499,8 @@ impl Engine {
     /// The code to show the operator, when this mode displays it.
     ///
     /// Before the device submits this is the operator-chosen code; afterwards it
-    /// is the code derived from both nonces. In [`CodeEntry::Host`] mode the host
+    /// is the code derived from the transcript-bound ECDH secret. In
+    /// [`CodeEntry::Host`] mode the host
     /// must not display this value: the phone displays it. The caller decides
     /// whether showing it is safe based on [`Engine::pairing_code_entry`].
     pub fn pairing_code(&self) -> Option<(String, u64)> {
@@ -668,26 +665,24 @@ impl Engine {
         // which endpoint displays it and which endpoint must type it. Nothing is
         // verified or persisted until the operator confirmation gate.
         {
-            // The code is a pure function of (session_id, host_nonce,
-            // device_nonce), so it can be derived here for display and again in
-            // `complete_pairing` for verification without keeping the secret
-            // around any longer than necessary.
-            let derived = {
-                let g = self
-                    .pairing
-                    .lock()
-                    .map_err(|_| ProtocolError::Internal("poisoned".into()))?;
-                let a = g.as_ref().ok_or(ProtocolError::NotPaired)?;
-                let mut probe = PairingSession::new(a.session.session_id, a.session.host_nonce);
-                probe.derive_with_device_nonce(submit.device_nonce)?;
-                probe.code()?
-            };
+            // Complete the ephemeral ECDH exchange with the device's keys and
+            // publish the transcript-bound code. The same session is reused by
+            // `complete_pairing`, so the displayed code and the MACs cover
+            // exactly the keys that will be enrolled.
             let mut g = self
                 .pairing
                 .lock()
                 .map_err(|_| ProtocolError::Internal("poisoned".into()))?;
             let a = g.as_mut().ok_or(ProtocolError::NotPaired)?;
-            a.derived = Some(derived);
+            a.session.derive_with_device_ephemeral(
+                &self.host.host_id,
+                &submit.device_id,
+                &self.host.public_key(),
+                &submit.device_pubkey,
+                submit.device_nonce,
+                submit.device_eph_pubkey,
+            )?;
+            a.derived = Some(a.session.code()?);
             a.phase = PairingPhase::AwaitingConfirmation;
         }
         self.audit.write(&Event::new("pairing_code_ready"));
@@ -749,7 +744,14 @@ impl Engine {
         }
 
         let mut session = active.session;
-        session.derive_with_device_nonce(submit.device_nonce)?;
+        session.derive_with_device_ephemeral(
+            &self.host.host_id,
+            &submit.device_id,
+            &self.host.public_key(),
+            &submit.device_pubkey,
+            submit.device_nonce,
+            submit.device_eph_pubkey,
+        )?;
         if let Some(chosen) = &active.chosen {
             if &session.code()? != chosen {
                 // When the operator selected a code, the device must have derived
@@ -881,6 +883,7 @@ impl Engine {
             code_entry: active.code_entry,
             expires_at: active.expires_at.max(now),
             host_nonce: active.session.host_nonce,
+            host_eph_pubkey: active.session.host_eph_public,
         };
         Ok(Message::PairingStart(start).to_frame())
     }

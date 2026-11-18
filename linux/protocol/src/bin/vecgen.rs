@@ -31,10 +31,23 @@ use android_fprint_protocol::types::{
     AuthReject, AuthRequest, AuthResponse, Challenge, ErrorMsg, Id, SessionHello, SessionHelloAck,
     AUTH_REQUEST_TTL_DEFAULT,
 };
+use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::SecretKey as P256SecretKey;
 use serde_json::{json, Value};
 
 fn hexs(b: &[u8]) -> String {
     hex::encode(b)
+}
+
+fn det_eph(seed: u8) -> P256SecretKey {
+    P256SecretKey::from_slice(&[seed; 32]).expect("valid P-256 scalar")
+}
+
+fn eph_public(secret: &P256SecretKey) -> [u8; crypto::PUBKEY_LEN] {
+    let point = secret.public_key().to_encoded_point(false);
+    let mut bytes = [0u8; crypto::PUBKEY_LEN];
+    bytes.copy_from_slice(point.as_bytes());
+    bytes
 }
 
 /// Builds a complete 13-byte frame header.
@@ -488,6 +501,7 @@ fn main() {
                     // current clock, so this vector is checked as raw CBOR only.
                     expires_at: 1_700_000_120,
                     host_nonce: [0x88; 32],
+                    host_eph_pubkey: eph_public(&det_eph(0x77)),
                 })
                 .to_payload()
             ),
@@ -503,6 +517,7 @@ fn main() {
                     device_pubkey: device_pk.clone(),
                     device_key_id: device_pk.key_id_hex(),
                     device_nonce: [0x99; 32],
+                    device_eph_pubkey: eph_public(&det_eph(0x66)),
                     mac: [0u8; 32],
                     cleanup_tokens: Vec::new(),
                 })
@@ -664,40 +679,70 @@ fn main() {
     // ---------------------------------------------------------------------
     // 6. Pairing transcript vectors
     // ---------------------------------------------------------------------
-    let mut session = PairingSession::new(det_id(0x99), [0x88; 32]);
-    session
-        .derive_with_device_nonce([0x99; 32])
-        .expect("derive");
     let host_id = det_id(0x22);
     let host_pk = host_sk.public_key();
+    let device_id = det_id(0x33);
+    let host_eph_sk = det_eph(0x77);
+    let device_eph_sk = det_eph(0x66);
+    let host_eph_pub = eph_public(&host_eph_sk);
+    let device_eph_pub = eph_public(&device_eph_sk);
+
+    let mut session =
+        PairingSession::with_host_ephemeral(det_id(0x99), [0x88; 32], host_eph_sk.clone());
+    session
+        .derive_with_device_ephemeral(
+            &host_id,
+            &device_id,
+            &host_pk,
+            &device_pk,
+            [0x99; 32],
+            device_eph_pub,
+        )
+        .expect("derive");
     let code = session.code().expect("code");
     let device_mac = session
-        .device_mac(&host_id, &det_id(0x33), &host_pk, &device_pk)
+        .device_mac(&host_id, &device_id, &host_pk, &device_pk)
         .expect("mac");
     let host_mac = session
-        .host_mac(&host_id, &det_id(0x33), &host_pk, &device_pk)
+        .host_mac(&host_id, &device_id, &host_pk, &device_pk)
         .expect("mac");
 
-    let mut wrong_device = PairingSession::new(det_id(0x99), [0x88; 32]);
-    wrong_device
-        .derive_with_device_nonce([0x99; 32])
-        .expect("derive");
     let impostor = PrivateKey::from_bytes(&[0x99; 32]).expect("valid key");
+    let mut wrong_device =
+        PairingSession::with_host_ephemeral(det_id(0x99), [0x88; 32], det_eph(0x77));
+    wrong_device
+        .derive_with_device_ephemeral(
+            &host_id,
+            &device_id,
+            &host_pk,
+            &impostor.public_key(),
+            [0x99; 32],
+            device_eph_pub,
+        )
+        .expect("derive");
     let impostor_mac = wrong_device
-        .device_mac(&host_id, &det_id(0x33), &host_pk, &impostor.public_key())
+        .device_mac(&host_id, &device_id, &host_pk, &impostor.public_key())
         .expect("mac");
 
     write_json(
         &out_dir.join("pairing.json"),
         &json!({
             "spec": "PROTOCOL.md §6",
-            "description": "Pairing transcript. Both sides derive the same session secret from the two nonces; the MACs prove it.",
+            "description": "Pairing transcript. Both sides derive the same ephemeral ECDH secret bound to the full transcript; the code and MACs prove it.",
             "host_id": hexs(host_id.as_bytes()),
             "device_id": hexs(det_id(0x33).as_bytes()),
             "session": {
                 "session_id": hexs(det_id(0x99).as_bytes()),
                 "host_nonce": hexs(&[0x88u8; 32]),
                 "device_nonce": hexs(&[0x99u8; 32]),
+            },
+            "host_ephemeral": {
+                "private_scalar_hex": hexs(&host_eph_sk.to_bytes()),
+                "public_key_hex": hexs(&host_eph_pub),
+            },
+            "device_ephemeral": {
+                "private_scalar_hex": hexs(&device_eph_sk.to_bytes()),
+                "public_key_hex": hexs(&device_eph_pub),
             },
             "code": code,
             "host_key": {

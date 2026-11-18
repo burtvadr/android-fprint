@@ -1,63 +1,195 @@
 //! Pairing: explicit, short-lived, and bound to a code the operator verifies on
 //! both screens (`PROTOCOL.md` §6).
 
+use p256::ecdh::diffie_hellman;
+use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::{PublicKey as P256PublicKey, SecretKey as P256SecretKey};
 use zeroize::Zeroize;
 
 use crate::cbor::{self, Value};
-use crate::crypto::{self, PublicKey};
+use crate::crypto::{self, PublicKey, PUBKEY_LEN};
 use crate::errors::{ProtocolError, Result};
 use crate::types::{
     opt_text, req_bytes, req_id, req_text, req_uint, Id, CHALLENGE_LEN, ID_LEN,
     PAIRING_CODE_DIGITS, PAIRING_TTL,
 };
 
-/// `PROTOCOL.md` §6.4. Holds the session secret between `PAIRING_START` and
-/// `PAIRING_RESULT`, and is zeroized on drop.
+/// `PROTOCOL.md` §6.4. Holds the pairing transcript and session secret between
+/// `PAIRING_START` and `PAIRING_RESULT`, and is zeroized on drop.
+///
+/// The secret is an ephemeral P-256 ECDH shared secret, not a hash of public
+/// nonces. A network attacker who substitutes either endpoint's keys therefore
+/// derives a *different* secret on each side, and the six-digit code shown to the
+/// operator will not match.
 pub struct PairingSession {
     pub session_id: Id,
     pub host_nonce: [u8; CHALLENGE_LEN],
     pub device_nonce: [u8; CHALLENGE_LEN],
+    /// Public half of the host's ephemeral ECDH key, sent in `PAIRING_START`.
+    pub host_eph_public: [u8; PUBKEY_LEN],
+    /// Public half of the device's ephemeral ECDH key, sent in `PAIRING_SUBMIT`.
+    pub device_eph_public: Option<[u8; PUBKEY_LEN]>,
+    /// Host-side ephemeral private key. Consumed on first derivation.
+    host_eph_secret: Option<P256SecretKey>,
     secret: [u8; 32],
+    /// Transcript bound into the secret, the code and both MACs.
+    transcript: Vec<u8>,
+    derived: bool,
 }
 
 impl PairingSession {
-    /// Host side: derive the session secret before the device nonce is known.
-    /// `derive_with_device_nonce` completes it once the device responds.
+    /// Host side: generate an ephemeral ECDH key before the device responds.
+    /// [`PairingSession::derive_with_device_ephemeral`] completes it once the
+    /// device's public key and ephemeral key arrive.
     pub fn new(session_id: Id, host_nonce: [u8; CHALLENGE_LEN]) -> PairingSession {
-        let mut secret = [0u8; 32];
-        // With an all-zero device nonce this is only a placeholder; the real
-        // secret is computed in `derive_with_device_nonce`.
-        secret.fill(0);
+        Self::with_host_ephemeral(
+            session_id,
+            host_nonce,
+            P256SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng),
+        )
+    }
+
+    /// Host side with a caller-supplied ephemeral scalar.
+    ///
+    /// Only for deterministic test vectors. Production callers use [`new`].
+    pub fn with_host_ephemeral(
+        session_id: Id,
+        host_nonce: [u8; CHALLENGE_LEN],
+        host_eph_secret: P256SecretKey,
+    ) -> PairingSession {
+        let host_eph_public = encode_public_key(&host_eph_secret);
         PairingSession {
             session_id,
             host_nonce,
             device_nonce: [0u8; CHALLENGE_LEN],
-            secret,
+            host_eph_public,
+            device_eph_public: None,
+            host_eph_secret: Some(host_eph_secret),
+            secret: [0u8; 32],
+            transcript: Vec::new(),
+            derived: false,
         }
     }
 
-    /// Computes the true session secret once both nonces exist.
-    pub fn derive_with_device_nonce(&mut self, device_nonce: [u8; CHALLENGE_LEN]) -> Result<()> {
+    /// Device side: generate its ephemeral key, bind the full transcript, and
+    /// derive the shared secret immediately.
+    ///
+    /// The host's long-term key, id, nonce and ephemeral key all come from
+    /// `PAIRING_START`; the device's own key and id are local. This is the only
+    /// place the device trusts those values, and the result is compared against
+    /// the code the operator reads from the host.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_device(
+        session_id: Id,
+        host_nonce: [u8; CHALLENGE_LEN],
+        host_eph_public: [u8; PUBKEY_LEN],
+        host_id: &Id,
+        host_pubkey: &PublicKey,
+        device_id: &Id,
+        device_pubkey: &PublicKey,
+        device_nonce: [u8; CHALLENGE_LEN],
+    ) -> Result<PairingSession> {
+        let device_eph_secret = P256SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let device_eph_public = encode_public_key(&device_eph_secret);
+        let mut session = PairingSession {
+            session_id,
+            host_nonce,
+            device_nonce,
+            host_eph_public,
+            device_eph_public: Some(device_eph_public),
+            host_eph_secret: None,
+            secret: [0u8; 32],
+            transcript: Vec::new(),
+            derived: false,
+        };
+        let peer = P256PublicKey::from_sec1_bytes(&host_eph_public).map_err(|_| {
+            ProtocolError::BadRequest("host ephemeral key is not a P-256 point".into())
+        })?;
+        let shared = diffie_hellman(device_eph_secret.to_nonzero_scalar(), peer.as_affine());
+        let transcript = session.transcript_with(
+            host_id,
+            device_id,
+            host_pubkey,
+            device_pubkey,
+            &device_eph_public,
+        );
+        session.finish_derivation(shared.raw_secret_bytes(), transcript)?;
+        Ok(session)
+    }
+
+    /// Host side: completes the exchange once `PAIRING_SUBMIT` has arrived.
+    ///
+    /// `device_eph_public` must be exactly the value covered by the device's
+    /// `device_mac`; anything else yields a different transcript and MAC.
+    pub fn derive_with_device_ephemeral(
+        &mut self,
+        host_id: &Id,
+        device_id: &Id,
+        host_pubkey: &PublicKey,
+        device_pubkey: &PublicKey,
+        device_nonce: [u8; CHALLENGE_LEN],
+        device_eph_public: [u8; PUBKEY_LEN],
+    ) -> Result<()> {
+        if self.derived {
+            // Idempotent only when the caller supplies the same transcript.
+            let t = self.transcript_with(
+                host_id,
+                device_id,
+                host_pubkey,
+                device_pubkey,
+                &device_eph_public,
+            );
+            if t == self.transcript && device_nonce == self.device_nonce {
+                return Ok(());
+            }
+            return Err(ProtocolError::ContextMismatch(
+                "pairing session was already bound to a different transcript".into(),
+            ));
+        }
+        let peer = P256PublicKey::from_sec1_bytes(&device_eph_public).map_err(|_| {
+            ProtocolError::BadRequest("device ephemeral key is not a P-256 point".into())
+        })?;
+        let secret = self
+            .host_eph_secret
+            .take()
+            .ok_or_else(|| ProtocolError::Internal("host ephemeral key already consumed".into()))?;
+        let shared = diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
         self.device_nonce = device_nonce;
-        let mut ikm = Vec::with_capacity(CHALLENGE_LEN * 2);
-        ikm.extend_from_slice(&self.host_nonce);
-        ikm.extend_from_slice(&device_nonce);
-        crypto::hkdf_sha256(
-            &ikm,
-            crypto::SALT_PAIR,
-            &self.session_id.0,
-            &mut self.secret,
-        )?;
-        ikm.zeroize();
+        self.device_eph_public = Some(device_eph_public);
+        let transcript = self.transcript_with(
+            host_id,
+            device_id,
+            host_pubkey,
+            device_pubkey,
+            &device_eph_public,
+        );
+        self.finish_derivation(shared.raw_secret_bytes(), transcript)
+    }
+
+    fn finish_derivation(&mut self, shared: &[u8], transcript: Vec<u8>) -> Result<()> {
+        let mut info = Vec::with_capacity(crypto::DOMAIN_PAIR_TRANSCRIPT.len() + transcript.len());
+        info.extend_from_slice(crypto::DOMAIN_PAIR_TRANSCRIPT);
+        info.extend_from_slice(&transcript);
+        crypto::hkdf_sha256(shared, crypto::SALT_PAIR, &info, &mut self.secret)?;
+        self.transcript = transcript;
+        self.derived = true;
         Ok(())
     }
 
-    /// `p = HMAC(pairing_secret, "ALP-PAIR-V1" || 0x00 || session_id)`.
+    /// `p = HMAC(pairing_secret, "ALP-PAIR-V1" || 0x00 || transcript)`.
+    ///
+    /// Including the transcript — ids, long-term keys, nonces and ephemeral keys
+    /// — binds the displayed code to the keys that will actually be enrolled.
     pub fn confirmation_key(&self) -> Result<[u8; 32]> {
-        let mut msg = Vec::with_capacity(crypto::DOMAIN_PAIR.len() + 1 + ID_LEN);
+        if !self.derived {
+            return Err(ProtocolError::Internal(
+                "pairing secret is not derived yet".into(),
+            ));
+        }
+        let mut msg = Vec::with_capacity(crypto::DOMAIN_PAIR.len() + 1 + self.transcript.len());
         msg.extend_from_slice(crypto::DOMAIN_PAIR);
         msg.push(0x00);
-        msg.extend_from_slice(&self.session_id.0);
+        msg.extend_from_slice(&self.transcript);
         Ok(crypto::hmac_sha256(&self.secret, &msg))
     }
 
@@ -75,15 +207,16 @@ impl PairingSession {
         Ok(format!("{:0width$}", v, width = PAIRING_CODE_DIGITS))
     }
 
-    /// The transcript bound into both confirmation MACs.
-    fn transcript(
+    /// The transcript bound into the secret, the code and both confirmation MACs.
+    fn transcript_with(
         &self,
         host_id: &Id,
         device_id: &Id,
         host_pub: &PublicKey,
         device_pub: &PublicKey,
+        device_eph_public: &[u8; PUBKEY_LEN],
     ) -> Vec<u8> {
-        let mut t = Vec::with_capacity(ID_LEN * 2 + crypto::PUBKEY_LEN * 2 + CHALLENGE_LEN * 2);
+        let mut t = Vec::with_capacity(ID_LEN * 2 + PUBKEY_LEN * 4 + CHALLENGE_LEN * 2);
         t.extend_from_slice(&self.session_id.0);
         t.extend_from_slice(&host_id.0);
         t.extend_from_slice(&device_id.0);
@@ -91,7 +224,31 @@ impl PairingSession {
         t.extend_from_slice(device_pub.as_bytes());
         t.extend_from_slice(&self.host_nonce);
         t.extend_from_slice(&self.device_nonce);
+        t.extend_from_slice(&self.host_eph_public);
+        t.extend_from_slice(device_eph_public);
         t
+    }
+
+    /// Refuses to MAC a transcript other than the one the secret was derived
+    /// from. Without this check a caller could display a code for one transcript
+    /// and confirm another.
+    fn checked_transcript(
+        &self,
+        host_id: &Id,
+        device_id: &Id,
+        host_pub: &PublicKey,
+        device_pub: &PublicKey,
+    ) -> Result<Vec<u8>> {
+        let device_eph = self.device_eph_public.ok_or_else(|| {
+            ProtocolError::Internal("device ephemeral key is not known yet".into())
+        })?;
+        let t = self.transcript_with(host_id, device_id, host_pub, device_pub, &device_eph);
+        if self.derived && t != self.transcript {
+            return Err(ProtocolError::ContextMismatch(
+                "pairing transcript does not match the derived secret".into(),
+            ));
+        }
+        Ok(t)
     }
 
     pub fn device_mac(
@@ -102,10 +259,12 @@ impl PairingSession {
         device_pub: &PublicKey,
     ) -> Result<[u8; 32]> {
         let p = self.confirmation_key()?;
-        let mut msg = Vec::with_capacity(crypto::DOMAIN_DEVICE_CONFIRM.len() + 1 + 512);
+        let transcript = self.checked_transcript(host_id, device_id, host_pub, device_pub)?;
+        let mut msg =
+            Vec::with_capacity(crypto::DOMAIN_DEVICE_CONFIRM.len() + 1 + transcript.len());
         msg.extend_from_slice(crypto::DOMAIN_DEVICE_CONFIRM);
         msg.push(0x00);
-        msg.extend_from_slice(&self.transcript(host_id, device_id, host_pub, device_pub));
+        msg.extend_from_slice(&transcript);
         Ok(crypto::hmac_sha256(&p, &msg))
     }
 
@@ -117,10 +276,11 @@ impl PairingSession {
         device_pub: &PublicKey,
     ) -> Result<[u8; 32]> {
         let p = self.confirmation_key()?;
-        let mut msg = Vec::with_capacity(crypto::DOMAIN_HOST_CONFIRM.len() + 1 + 512);
+        let transcript = self.checked_transcript(host_id, device_id, host_pub, device_pub)?;
+        let mut msg = Vec::with_capacity(crypto::DOMAIN_HOST_CONFIRM.len() + 1 + transcript.len());
         msg.extend_from_slice(crypto::DOMAIN_HOST_CONFIRM);
         msg.push(0x00);
-        msg.extend_from_slice(&self.transcript(host_id, device_id, host_pub, device_pub));
+        msg.extend_from_slice(&transcript);
         Ok(crypto::hmac_sha256(&p, &msg))
     }
 
@@ -138,7 +298,18 @@ impl Drop for PairingSession {
         self.secret.zeroize();
         self.host_nonce.zeroize();
         self.device_nonce.zeroize();
+        self.transcript.zeroize();
+        // `SecretKey` zeroizes on drop; take it so this struct has no other copy.
+        self.host_eph_secret.take();
     }
+}
+
+/// SEC1-uncompressed encoding of an ephemeral P-256 public key.
+fn encode_public_key(secret: &P256SecretKey) -> [u8; PUBKEY_LEN] {
+    let point = secret.public_key().to_encoded_point(false);
+    let mut bytes = [0u8; PUBKEY_LEN];
+    bytes.copy_from_slice(point.as_bytes());
+    bytes
 }
 
 impl std::fmt::Debug for PairingSession {
@@ -177,6 +348,22 @@ fn code_from_material(p: &[u8; 32]) -> u64 {
         msg.extend_from_slice(&counter.to_be_bytes());
         block = crypto::hmac_sha256(p, &msg);
     }
+}
+
+/// Reads and validates a P-256 ephemeral public key.
+fn req_eph_public(v: &Value, name: &str) -> Result<[u8; PUBKEY_LEN]> {
+    let bytes = req_bytes(v, name)?;
+    if bytes.len() != PUBKEY_LEN {
+        return Err(ProtocolError::BadRequest(format!(
+            "{name} must be {PUBKEY_LEN} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    P256PublicKey::from_sec1_bytes(bytes)
+        .map_err(|_| ProtocolError::BadRequest(format!("{name} is not a valid P-256 point")))?;
+    let mut out = [0u8; PUBKEY_LEN];
+    out.copy_from_slice(bytes);
+    Ok(out)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -231,6 +418,9 @@ pub struct PairingStart {
     pub code_entry: CodeEntry,
     pub expires_at: u64,
     pub host_nonce: [u8; CHALLENGE_LEN],
+    /// Host ephemeral ECDH public key. The pairing secret is derived from the
+    /// ECDH result, so an on-path attacker cannot compute the code.
+    pub host_eph_pubkey: [u8; PUBKEY_LEN],
 }
 
 impl PairingStart {
@@ -243,6 +433,10 @@ impl PairingStart {
             ("host_id", Value::Bytes(self.host_id.0.to_vec())),
             ("host_key_id", Value::text(self.host_key_id.clone())),
             ("host_nonce", Value::Bytes(self.host_nonce.to_vec())),
+            (
+                "host_eph_pubkey",
+                Value::Bytes(self.host_eph_pubkey.to_vec()),
+            ),
             (
                 "host_pubkey",
                 Value::Bytes(self.host_pubkey.as_bytes().to_vec()),
@@ -294,6 +488,7 @@ impl PairingStart {
             code_entry,
             expires_at,
             host_nonce,
+            host_eph_pubkey: req_eph_public(&v, "host_eph_pubkey")?,
         })
     }
 }
@@ -306,6 +501,8 @@ pub struct PairingSubmit {
     pub device_pubkey: PublicKey,
     pub device_key_id: String,
     pub device_nonce: [u8; CHALLENGE_LEN],
+    /// Device ephemeral ECDH public key, completing the pairing secret.
+    pub device_eph_pubkey: [u8; PUBKEY_LEN],
     pub mac: [u8; 32],
     /// Revocation tokens for older pairings this phone wants the host to clean up.
     ///
@@ -322,6 +519,10 @@ impl PairingSubmit {
             ("device_key_id", Value::text(self.device_key_id.clone())),
             ("device_name", Value::text(self.device_name.clone())),
             ("device_nonce", Value::Bytes(self.device_nonce.to_vec())),
+            (
+                "device_eph_pubkey",
+                Value::Bytes(self.device_eph_pubkey.to_vec()),
+            ),
             (
                 "device_pubkey",
                 Value::Bytes(self.device_pubkey.as_bytes().to_vec()),
@@ -388,6 +589,7 @@ impl PairingSubmit {
             device_pubkey: PublicKey::from_bytes(req_bytes(&v, "device_pubkey")?)?,
             device_key_id: req_text(&v, "device_key_id")?,
             device_nonce,
+            device_eph_pubkey: req_eph_public(&v, "device_eph_pubkey")?,
             mac,
             cleanup_tokens,
         })
@@ -499,15 +701,49 @@ mod tests {
     use super::*;
     use crate::crypto::PrivateKey;
 
-    fn session() -> PairingSession {
+    fn keys() -> (PrivateKey, PrivateKey) {
+        (
+            PrivateKey::from_bytes(&[0xA1; 32]).unwrap(),
+            PrivateKey::from_bytes(&[0xB2; 32]).unwrap(),
+        )
+    }
+
+    fn ids() -> (Id, Id) {
+        (
+            Id::from_slice(&[0x10; 16]).unwrap(),
+            Id::from_slice(&[0x20; 16]).unwrap(),
+        )
+    }
+
+    fn eph_public(seed: u8) -> [u8; PUBKEY_LEN] {
+        encode_public_key(&P256SecretKey::from_slice(&[seed; 32]).unwrap())
+    }
+
+    fn derived_session(
+        host_id: &Id,
+        device_id: &Id,
+        host_sk: &PrivateKey,
+        dev_sk: &PrivateKey,
+    ) -> PairingSession {
         let mut s = PairingSession::new(Id::from_slice(&[1u8; 16]).unwrap(), [2u8; 32]);
-        s.derive_with_device_nonce([3u8; 32]).unwrap();
+        let dev_eph = P256SecretKey::from_slice(&[4u8; 32]).unwrap();
+        s.derive_with_device_ephemeral(
+            host_id,
+            device_id,
+            &host_sk.public_key(),
+            &dev_sk.public_key(),
+            [3u8; 32],
+            encode_public_key(&dev_eph),
+        )
+        .unwrap();
         s
     }
 
     #[test]
     fn code_is_six_digits_and_stable() {
-        let s = session();
+        let (h, d) = keys();
+        let (hid, did) = ids();
+        let s = derived_session(&hid, &did, &h, &d);
         let c = s.code().unwrap();
         assert_eq!(c.len(), 6);
         assert!(c.chars().all(|x| x.is_ascii_digit()));
@@ -519,8 +755,19 @@ mod tests {
         // A one-byte truncation can only produce 000000..000255. The new code
         // must escape that range for at least one deterministic session.
         for i in 0u8..64 {
+            let host_sk = PrivateKey::from_bytes(&[i.wrapping_add(1); 32]).unwrap();
+            let dev_sk = PrivateKey::from_bytes(&[i.wrapping_add(2); 32]).unwrap();
             let mut s = PairingSession::new(Id::from_slice(&[i; 16]).unwrap(), [i; 32]);
-            s.derive_with_device_nonce([i.wrapping_add(1); 32]).unwrap();
+            let dev_eph = P256SecretKey::from_slice(&[i.wrapping_add(3); 32]).unwrap();
+            s.derive_with_device_ephemeral(
+                &Id::from_slice(&[i; 16]).unwrap(),
+                &Id::from_slice(&[i.wrapping_add(1); 16]).unwrap(),
+                &host_sk.public_key(),
+                &dev_sk.public_key(),
+                [i.wrapping_add(4); 32],
+                encode_public_key(&dev_eph),
+            )
+            .unwrap();
             if s.code().unwrap().parse::<u32>().unwrap() > 255 {
                 return;
             }
@@ -529,20 +776,91 @@ mod tests {
     }
 
     #[test]
+    fn code_is_bound_to_the_public_keys() {
+        // Same session id and nonces, different device key: the code MUST change.
+        // The old construction derived it from public nonces only.
+        let (h, d) = keys();
+        let (hid, did) = ids();
+        let a = derived_session(&hid, &did, &h, &d).code().unwrap();
+
+        let evil = PrivateKey::from_bytes(&[0xCC; 32]).unwrap();
+        let b = derived_session(&hid, &did, &h, &evil).code().unwrap();
+        assert_ne!(a, b, "pairing code ignores the enrolled public key");
+    }
+
+    #[test]
+    fn man_in_the_middle_cannot_make_both_codes_match() {
+        // The attacker terminates the exchange on both sides, keeping the host
+        // nonce and session id but substituting its own keys and ephemeral keys.
+        // Each side derives a different ECDH secret, so the codes differ and the
+        // operator sees a mismatch. An attacker can only succeed by finding two
+        // ephemeral keys whose short codes collide (~2^20 work) during one live
+        // session; the session is single-use and rate-limited.
+        let (host_sk, device_sk) = keys();
+        let (host_id, device_id) = ids();
+        let attacker_host_sk = PrivateKey::from_bytes(&[0xDD; 32]).unwrap();
+        let attacker_device_sk = PrivateKey::from_bytes(&[0xEE; 32]).unwrap();
+        let attacker_host_eph = P256SecretKey::from_slice(&[0x11; 32]).unwrap();
+        let attacker_device_eph = P256SecretKey::from_slice(&[0x22; 32]).unwrap();
+
+        // Host sees the attacker as the device.
+        let mut host_view = PairingSession::new(Id::from_slice(&[1u8; 16]).unwrap(), [2u8; 32]);
+        host_view
+            .derive_with_device_ephemeral(
+                &host_id,
+                &device_id,
+                &host_sk.public_key(),
+                &attacker_device_sk.public_key(),
+                [3u8; 32],
+                encode_public_key(&attacker_device_eph),
+            )
+            .unwrap();
+        let host_code = host_view.code().unwrap();
+
+        // Phone sees the attacker as the host.
+        let phone_view = PairingSession::new_device(
+            Id::from_slice(&[1u8; 16]).unwrap(),
+            [2u8; 32],
+            encode_public_key(&attacker_host_eph),
+            &host_id,
+            &attacker_host_sk.public_key(),
+            &device_id,
+            &device_sk.public_key(),
+            [3u8; 32],
+        )
+        .unwrap();
+        let phone_code = phone_view.code().unwrap();
+
+        assert_ne!(
+            host_code, phone_code,
+            "an on-path key substitution produced the same code on both endpoints"
+        );
+    }
+
+    #[test]
     fn code_changes_with_the_device_nonce() {
-        let a = session().code().unwrap();
+        let (h, d) = keys();
+        let (hid, did) = ids();
+        let a = derived_session(&hid, &did, &h, &d).code().unwrap();
         let mut s2 = PairingSession::new(Id::from_slice(&[1u8; 16]).unwrap(), [2u8; 32]);
-        s2.derive_with_device_nonce([9u8; 32]).unwrap();
+        let dev_eph = P256SecretKey::from_slice(&[4u8; 32]).unwrap();
+        s2.derive_with_device_ephemeral(
+            &hid,
+            &did,
+            &h.public_key(),
+            &d.public_key(),
+            [9u8; 32],
+            encode_public_key(&dev_eph),
+        )
+        .unwrap();
         assert_ne!(a, s2.code().unwrap());
     }
 
     #[test]
     fn macs_verify_and_detect_substitution() {
-        let host_sk = PrivateKey::from_bytes(&[0xA1; 32]).unwrap();
-        let dev_sk = PrivateKey::from_bytes(&[0xB2; 32]).unwrap();
-        let hid = Id::from_slice(&[0x10; 16]).unwrap();
-        let did = Id::from_slice(&[0x20; 16]).unwrap();
-        let s = session();
+        let (host_sk, dev_sk) = keys();
+        let (hid, did) = ids();
+        let s = derived_session(&hid, &did, &host_sk, &dev_sk);
 
         let mac = s
             .device_mac(&hid, &did, &host_sk.public_key(), &dev_sk.public_key())
@@ -552,17 +870,19 @@ mod tests {
         // An attacker substituting its own device key must fail, even though
         // everything else about the transcript is unchanged.
         let evil_sk = PrivateKey::from_bytes(&[0xCC; 32]).unwrap();
-        let evil_mac = s
-            .device_mac(&hid, &did, &host_sk.public_key(), &evil_sk.public_key())
-            .unwrap();
-        assert!(PairingSession::verify_mac(&mac, &evil_mac).is_err());
+        let evil_mac = s.device_mac(&hid, &did, &host_sk.public_key(), &evil_sk.public_key());
+        assert!(
+            evil_mac.is_err(),
+            "a substituted device key produced a MAC for the accepted transcript"
+        );
 
         // Substituting the host key must also fail.
         let evil_host = PrivateKey::from_bytes(&[0xDD; 32]).unwrap();
-        let mac2 = s
-            .device_mac(&hid, &did, &evil_host.public_key(), &dev_sk.public_key())
-            .unwrap();
-        assert!(PairingSession::verify_mac(&mac, &mac2).is_err());
+        let mac2 = s.device_mac(&hid, &did, &evil_host.public_key(), &dev_sk.public_key());
+        assert!(
+            mac2.is_err(),
+            "a substituted host key produced a MAC for the accepted transcript"
+        );
 
         // Device and host MACs use different domain separators.
         let hm = s
@@ -575,7 +895,8 @@ mod tests {
     fn message_roundtrips() {
         let host_sk = PrivateKey::from_bytes(&[1u8; 32]).unwrap();
         let dev_sk = PrivateKey::from_bytes(&[2u8; 32]).unwrap();
-        let s = session();
+        let (hid, did) = ids();
+        let s = derived_session(&hid, &did, &host_sk, &dev_sk);
 
         let start = PairingStart {
             session_id: Id::from_slice(&[1u8; 16]).unwrap(),
@@ -586,6 +907,7 @@ mod tests {
             code_entry: CodeEntry::Device,
             expires_at: crate::unix_now() + 30,
             host_nonce: [3u8; 32],
+            host_eph_pubkey: eph_public(7),
         };
         assert_eq!(
             PairingStart::from_payload(&start.to_payload()).unwrap(),
@@ -599,6 +921,7 @@ mod tests {
             device_pubkey: dev_sk.public_key(),
             device_key_id: dev_sk.public_key().key_id_hex(),
             device_nonce: [5u8; 32],
+            device_eph_pubkey: eph_public(8),
             mac: [6u8; 32],
             cleanup_tokens: vec![[8u8; 32]],
         };
@@ -647,6 +970,7 @@ mod tests {
             code_entry: CodeEntry::Host,
             expires_at,
             host_nonce: [3u8; 32],
+            host_eph_pubkey: eph_public(7),
         };
         let now = crate::unix_now();
         // Expired.
@@ -671,6 +995,7 @@ mod tests {
             code_entry: CodeEntry::Device,
             expires_at: crate::unix_now() + 30,
             host_nonce: [3u8; 32],
+            host_eph_pubkey: eph_public(7),
         };
         assert!(PairingStart::from_payload(&start.to_payload()).is_ok());
     }
@@ -687,6 +1012,7 @@ mod tests {
             code_entry: CodeEntry::Host,
             expires_at: crate::unix_now() + 30,
             host_nonce: [3u8; 32],
+            host_eph_pubkey: eph_public(7),
         };
         let payload = start.to_payload();
         assert_eq!(
@@ -741,6 +1067,7 @@ mod tests {
             code_entry: CodeEntry::Device,
             expires_at: crate::unix_now() + 30,
             host_nonce: [3u8; 32],
+            host_eph_pubkey: eph_public(7),
         };
         assert!(PairingStart::from_payload(&mk("12345").to_payload()).is_err());
         assert!(PairingStart::from_payload(&mk("1234567").to_payload()).is_err());
@@ -750,7 +1077,9 @@ mod tests {
 
     #[test]
     fn debug_output_leaks_no_secret() {
-        let s = session();
+        let (h, d) = keys();
+        let (hid, did) = ids();
+        let s = derived_session(&hid, &did, &h, &d);
         let text = format!("{s:?}");
         let code = s.code().unwrap();
         assert!(
