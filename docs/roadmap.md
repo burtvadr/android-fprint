@@ -189,6 +189,44 @@ The phone prompt must show enough to make a correct decision:
 The prompt must not show an unsigned display name as the host identity. Account
 and operation come from the signed request context.
 
+### Password field plus a visible phone option
+
+The current PAM integration cannot show both at once. GNOME's lock screen is not
+a generic PAM UI: it knows a password field and, through fprintd, a local
+fingerprint method. It does not render arbitrary PAM modules as buttons.
+
+With the phone line first:
+
+```text
+auth sufficient pam_phone_auth.so ...
+auth include system-local-login
+```
+
+PAM tries the phone first. If it succeeds, the password stack is skipped. If it
+fails or times out, the password path runs. That is an invisible priority order,
+not two visible choices.
+
+To show a password field **and** a phone biometric option side by side, one of
+these is required:
+
+1. **A fprintd-compatible virtual device** — GNOME/KDE show their normal
+   biometric UI and keep the password field. This is the clean desktop path, but
+   it is a system service, conflicts with a real fprintd unless proxied, and the
+   fprintd API does not carry the PAM service/operation context.
+2. **A GDM/gnome-shell patch or extension** — add a phone button to the lock
+   screen. Not portable, security-sensitive, and not recommended as the first
+   path.
+3. **PAM only** — accept that the phone is tried before the password and the
+   password appears after the timeout. This is what works today.
+
+Do not try to fake two PAM methods by stacking `optional` and `sufficient`
+lines. `optional` does not satisfy authentication, and `sufficient` still
+short-circuits the password path; the UI will not gain a second button.
+
+Decision for now: keep the PAM-first behavior with a 5 s fallback. Revisit a
+fprintd-compatible adapter only after SEC-004 and a real packaging/security
+review.
+
 ### Waiting, fallback and the “looks broken” problem
 
 The lock screen test now works, but the host shows no visible “check your phone”
