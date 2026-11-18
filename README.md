@@ -331,6 +331,7 @@ one device and is revocable independently.
 * [`docs/architecture.md`](docs/architecture.md) — layering and component map
 * [`docs/threat-model.md`](docs/threat-model.md) — adversaries, defences, limitations
 * [`docs/pairing.md`](docs/pairing.md) — the pairing flow and its guarantees
+* [`docs/security-audit.md`](docs/security-audit.md) — audit tracker and current findings
 
 ## Credits
 
