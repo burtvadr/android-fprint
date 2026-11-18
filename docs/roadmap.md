@@ -344,6 +344,81 @@ deliberate, strongly discouraged policy; root can already change `sudoers`,
 polkit and PAM, so treating a phone as a root factor deserves its own warning and
 audit entry.
 
+### Per-account and per-device policy matrix
+
+A device is not just “allowed” or “not allowed”. The host policy needs four
+separate questions:
+
+1. **Device principal** — whose phone is it? (`desktop`'s phone, `alice`'s phone)
+2. **Target account** — which Linux user is being authenticated? (`desktop` or
+   `alice`)
+3. **Operation** — login, unlock, user-level auth, polkit action, `sudo`, root?
+4. **Device consent** — does the phone user approve this specific request now?
+
+The effective decision is the intersection of all four, plus the account's normal
+`sudoers`/polkit rights. A phone can never grant a right the account does not
+already have.
+
+Example configuration for 1 PC, 2 phones, 2 accounts:
+
+```text
+account desktop  (in wheel)
+  phone A -> principal desktop
+  phone B -> principal alice
+
+account alice    (not in wheel)
+```
+
+| Target account | Operation | Phone A (desktop) | Phone B (alice) |
+|---|---|---|---|
+| desktop | login / unlock / user auth | allowed, configurable | **denied by default**; can be enabled as delegated login |
+| desktop | `sudo` / elevated polkit | allowed by host policy; still checked by sudoers/polkit | **never** |
+| alice | login / unlock / user auth | **denied by default**; can be enabled as delegated login | allowed, configurable |
+| alice | `sudo` / elevated polkit | no; alice has no sudo rights | **never** |
+
+This gives every combination you described:
+
+- **Phone login for the non-root user can be disabled entirely.** Set
+  `phone_login=false` for `alice`; PAM ignores the phone module for that account
+  and the password is required.
+- **Phone login for the non-root user can be enabled** for alice's own phone,
+  limited to login/unlock/user-level auth.
+- **The sudo user's phone can be allowed to log in as alice** as a delegated
+  login, or denied. Default: denied.
+- **The non-root phone can never get elevated rights**, even if its owner asks.
+  The host should not send `sudo`/root requests to it; sudoers/polkit still deny
+  if one somehow arrives.
+- **The non-root phone cannot log in as the sudo user** unless the host
+  administrator explicitly enables that delegation; default: denied.
+
+Suggested policy fields:
+
+```text
+account alice:
+  phone_login: false | true
+  allowed_phones: [phone-B]           # or a device-id list
+  allow_delegated_login_from: [phone-A]  # default empty
+  allowed_operations: [login, unlock, user-auth]
+  allow_elevated: false               # always false unless root policy says otherwise
+
+account desktop:
+  phone_login: true
+  allowed_phones: [phone-A]
+  allow_delegated_login_from: []
+  allowed_operations: [login, unlock, user-auth, sudo, polkit-admin]
+  allow_elevated: true                # still constrained by sudoers/polkit
+```
+
+Cross-account authentication is **delegation**, not identity sharing: the phone
+prompt must show both “who is approving” and “which account is being signed in”.
+Audit it as a delegated decision. Default it to off. A shared phone or a phone
+allowed to log in as another account is one compromise domain; separate phones
+remain the stronger model.
+
+Do not implement this by reusing an admin session or by silently switching the
+signed username. The target account is always in the signed request; the host
+policy decides whether that device is permitted to name it.
+
 ### Authentication is not authorization
 
 | Layer | Decides | Phone role |
@@ -425,6 +500,13 @@ Do these before expanding the platform surface:
 - [ ] Do not require re-pairing the same host for each Linux user; keep host
       identity machine-scoped and user identity per request.
 - [ ] Document install/enable/disable/phone-mask/uninstall as distinct states.
+- [ ] Implement the per-account/per-device matrix: `phone_login`,
+      `allowed_phones`, `allow_delegated_login_from`, `allowed_operations`, and
+      `allow_elevated`.
+- [ ] Show both the approving principal and the target account on the phone;
+      audit delegated login separately.
+- [ ] Refuse to send `sudo`/elevated requests to a device whose policy cannot
+      approve them, before the phone is prompted.
 
 ### Phase 2 — Capability protocol v1
 
