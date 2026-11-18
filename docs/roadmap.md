@@ -465,6 +465,126 @@ The phone displays only actions the host advertises, and the host still enforces
 its own policy. A stale toggle for an action the host no longer advertises is
 ignored, not treated as consent.
 
+## CLI and pairing UX
+
+The current `phone-authctl pair` flow is secure enough to finish a pairing, but
+the interaction is awkward and misleading. It should feel like `adb`, not like a
+guided wizard.
+
+### What it does today
+
+```text
+$ sudo phone-authctl pair
+Pairing open for 120s.
+Start pairing on the phone now.
+
+Pairing code (shown only here; enter it on the phone):
+
+      ┌────────────────┐
+      │  198168  │
+      └────────────────┘
+
+Send this pairing to the phone? [y/N] y
+Confirming pairing…
+Host record saved. Enter the code on the phone to finish pairing.
+Host side pairing finished.
+```
+
+Problems:
+
+- The host asks `Send this pairing to the phone?` **after** already showing the
+  code and receiving the phone's submission. The question describes an action
+  that already happened.
+- `Host record saved` appears before the phone has confirmed anything. The host
+  has persisted its side; the phone may still reject, timeout or lose the link.
+  This reads like success when the pairing is not finished.
+- The boxed code is noisy, and the important value is buried in prose.
+- The command exits as soon as the host side is done, without saying whether the
+  phone stored the host. A user has to guess from the app.
+- `sudo` or a fresh group login is needed for the control socket, and the error
+  does not explain the stale-group case. `phone-authctl pair` should work as the
+  desktop user, and a permission failure should print the exact `newgrp`/re-login
+  hint.
+- `list` is a prose dump, not a stable table, and there is no single place to see
+  `paired / connected / pending / revoked`.
+- `--yes` is a footgun that exists only to skip a redundant prompt.
+
+### Target: adb-like behavior
+
+One explicit command opens a short-lived pairing session, prints one code, waits,
+and reports one final result:
+
+```text
+$ phone-authctl pair
+Waiting for phone... (120s)
+Code: 198168  type this on the phone
+
+Paired  Pixel 9
+  host    archlinux
+  device  91620145
+```
+
+- No host-side `[y/N]`. Running `pair` is already the operator's decision; the
+  phone's typed code or Allow is the human gate. If a host confirmation is ever
+  wanted, make it an explicit `--confirm`, not the default.
+- Print the code as a plain line, not box art. Keep it out of logs.
+- Do not print `Paired` until the phone has persisted the host and acknowledged
+  it. Before that, say `Waiting for phone confirmation`.
+- On failure, print one line and a non-zero exit:
+  `Pairing failed: code mismatch` / `Pairing timed out` / `Pairing cancelled on phone`.
+- Stable exit codes: `0` paired, `1` failure, `2` usage/cannot connect.
+- Ctrl-C cancels the session; the host must delete the pending record.
+- `--json` emits one machine-readable object with `state`, `code`, `device`,
+  `host`, `expires_at` and `error`; human text goes to stderr when `--json` is on.
+- `--timeout` changes the session lifetime; it does not change the protocol
+  maximum.
+
+A device view should be boring and scriptable, like `adb devices`:
+
+```text
+$ phone-authctl devices
+DEVICE                    MODEL                 STATE       LAST SEEN
+Pixel 9 (91620145)        motorola edge 30 ultra connected   12:08
+```
+
+`phone-authctl list` can remain as an alias for one release, then be retired.
+
+### Protocol change needed for honest completion
+
+Right now the host persists its device record before it sends `PAIRING_RESULT`,
+while the phone persists only after its human gate. That is why the CLI can say
+`Host record saved` while the phone still has not accepted.
+
+To make the CLI truthful, add a final device-to-host acknowledgement after the
+phone persists, for example `PAIRING_CONFIRMED`:
+
+1. Host verifies `device_mac`, stores the record as **pending**, sends
+   `PAIRING_RESULT`.
+2. Phone verifies `host_mac`, asks the operator, then persists.
+3. Phone sends `PAIRING_CONFIRMED` (bound to the same session/transcript).
+4. Host promotes the record to **paired** and the CLI prints `Paired`.
+5. Timeout, rejection, code mismatch or link loss deletes the pending record.
+
+Until that exists, the CLI must not claim the pairing is complete; it should say
+`Host side complete; waiting for the phone` and leave the final state to
+`phone-authctl devices`.
+
+### Acceptance criteria
+
+- [ ] `phone-authctl pair` is one command, one code line, one final result.
+- [ ] No default `[y/N]` and no `--yes` requirement.
+- [ ] No `Paired`/`Host record saved` text before the phone confirms.
+- [ ] Pending records are separate from paired records and are cleaned on
+      timeout, rejection, mismatch or disconnect.
+- [ ] Device-to-host `PAIRING_CONFIRMED` is specified, implemented in Rust and
+      Kotlin, and covered by vectors.
+- [ ] `phone-authctl devices` prints a stable table; `--json` prints one object.
+- [ ] Permission denied explains `newgrp phone-auth` / re-login, and normal
+      pairing works without `sudo` for a user in the `phone-auth` group.
+- [ ] `phone-authctl unpair <device>` is a first-class command, not only a hidden
+      daemon operation.
+- [ ] README and `docs/pairing.md` use the real command transcript.
+
 ## Roadmap phases
 
 ### Phase 0 — Security remediation
@@ -491,6 +611,9 @@ Do these before expanding the platform surface:
 
 ### Phase 1 — Linux production integration
 
+- [ ] Implement the adb-like pairing and device UX described in
+      [CLI and pairing UX](#cli-and-pairing-ux): one code line, no default
+      confirmation prompt, truthful completion, `devices --json`, `unpair`.
 - [ ] Provide distro-specific PAM documentation:
       Debian/Ubuntu `common-auth`; Arch `/etc/pam.d/sudo`, `polkit-1`,
       `gdm-password`; Fedora equivalents.
