@@ -47,7 +47,7 @@ Authenticated.
 | `phone-authctl` | working |
 | `phone-auth-sim` | working, including deliberate misbehaviour for tests |
 | `pam_phone_auth` | one line in the PAM stack you choose; scope it to `sudo`, polkit or login deliberately (`make verify-all-auth`) |
-| Android app | validated on a Motorola Edge 30 Ultra: Wi-Fi discovery, both pairing code directions, background auto-prompt, biometric-gated signing, auto-close after the decision |
+| Android app | validated on Android 17 LineageOS : Wi-Fi discovery, both pairing code directions, background auto-prompt, biometric-gated signing, auto-close after the decision |
 | polkit agent | **unnecessary** — see below. Kept for headless hosts only |
 | BLE transport | framing and segmentation complete and tested; BlueZ/central wiring not done |
 | fprintd compatibility | not started, deliberately last |
