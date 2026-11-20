@@ -4,9 +4,9 @@
 
 
 
-Your phone acts as a **remote cryptographic authenticator** for a host
-machine. The phone approves with system biometric UI; The host verifies a
-signature over a fresh challenge instead of trusting a transmitted `YES`.
+Your phone acts as a **remote cryptographic authenticator** for a single 
+or multiple host machines. The phone approves with system biometric UI;
+The host verifies a signature over a fresh challenge instead of trusting a transmitted `YES`.
 
 ㅤ
 
