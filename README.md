@@ -1,7 +1,7 @@
-# Android Remote Biometric Authenticator for Linux
+# Remote Biometric Authenticator
 
-An Android phone acts as a **remote cryptographic authenticator** for a Linux
-machine. The phone approves with Android's system biometric UI; Linux verifies a
+Your phone acts as a **remote cryptographic authenticator** for a host
+machine. The phone approves with system biometric UI; The host verifies a
 signature over a fresh challenge instead of trusting a transmitted `YES`.
 
 <p align="center">
