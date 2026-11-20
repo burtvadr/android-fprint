@@ -8,7 +8,7 @@ Your phone acts as a **remote cryptographic authenticator** for a host
 machine. The phone approves with system biometric UI; The host verifies a
 signature over a fresh challenge instead of trusting a transmitted `YES`.
 
-
+ㅤ
 
 <p align="center">
   <a href="media/demo/demo-v2.mp4">
