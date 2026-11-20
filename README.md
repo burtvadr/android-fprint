@@ -1,4 +1,8 @@
-# Remote Biometric Authenticator
+# Remote Biometric Authenticator (v0.0.1)
+
+<img src="media/icons/auto/android-fprint-dark.svg" width="128" height="128" alt="Dark icon" align="right" />
+
+
 
 Your phone acts as a **remote cryptographic authenticator** for a host
 machine. The phone approves with system biometric UI; The host verifies a
@@ -12,12 +16,6 @@ signature over a fresh challenge instead of trusting a transmitted `YES`.
 
 <p align="center">
   <a href="media/demo/demo-v2.mp4">▶ Watch the full demo video</a>
-</p>
-
-<p align="center">
-  <img src="media/icons/auto/android-fprint-dark.svg" width="180" alt="Dark icon" />
-  &nbsp;&nbsp;
-  <img src="media/icons/auto/android-fprint-light.svg" width="180" alt="Light icon" />
 </p>
 
 <p align="center"><sub>Fingerprint mark adapted from <a href="https://www.svgrepo.com/svg/246819/fingerprint">SVG Repo's Security 15 collection</a> (CC0), heavily modified.</sub></p>
