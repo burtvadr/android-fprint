@@ -1,6 +1,6 @@
 # Remote Biometric Authenticator (v0.0.1)
 
-<img src="media/icons/auto/android-fprint-dark.svg" width="128" height="128" alt="Dark icon" align="right" />
+<img src="media/icons/auto/android-fprint-light.svg" width="128" height="128" alt="Light icon" align="right" />
 
 
 
